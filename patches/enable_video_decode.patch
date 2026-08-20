@@ -1,0 +1,94 @@
+diff --git a/locateanything_fix.py b/locateanything_fix.py
+index ca0f95f..8719ca9 100644
+--- a/locateanything_fix.py
++++ b/locateanything_fix.py
+@@ -67,7 +67,7 @@ import torch.nn.functional as F
+ 
+ __all__ = ["apply", "revert", "is_applied", "verify", "enable_vision_cache",
+            "enable_packed_vision", "enable_logits_slice", "disable_logits_slice",
+-           "VisionCache"]
++           "enable_video_decode", "VisionCache"]
+ 
+ _MARK = "_locateanything_sdpa_4d"
+ 
+@@ -81,6 +81,80 @@ def _find_vit_module():
+     return None
+ 
+ 
++def _find_processing_module():
++    """The dynamically imported processing_locateanything, or None."""
++    for name, mod in list(sys.modules.items()):
++        if "transformers_modules" in name and name.endswith("processing_locateanything"):
++            if hasattr(mod, "VIDEO_READER_BACKENDS"):
++                return mod
++    return None
++
++
++def enable_video_decode(verbose: bool = True) -> bool:
++    """Make video input decode at all on torchvision >= 0.19.
++
++    `process_vision_info()` defaults to `video_reader_backend="torchvision"`, and
++    `_read_video_torchvision` calls `torchvision.io.read_video`, which was removed
++    in 0.19. Every video request dies with
++
++        module 'torchvision.io' has no attribute 'read_video'
++
++    and the error is swallowed into a log line that says it is falling back to
++    torchvision -- which is what just failed. The decord reader in the same module
++    works; nothing selects it unless the caller passes the backend explicitly.
++
++    This points the "torchvision" entry at the decord reader when, and only when,
++    torchvision cannot actually do the job. No new dependency: decord is already
++    in requirements-model.txt.
++
++    Call it any time after the processor's custom code is imported (i.e. after the
++    first AutoProcessor.from_pretrained(..., trust_remote_code=True)).
++    """
++    mod = _find_processing_module()
++    if mod is None:
++        raise RuntimeError(
++            "processing_locateanything is not imported yet. Load the processor "
++            "first:\n    AutoProcessor.from_pretrained(..., trust_remote_code=True)")
++
++    try:
++        from torchvision import io as _tvio
++        if hasattr(_tvio, "read_video"):
++            if verbose:
++                print("locateanything_fix: torchvision.io.read_video present; "
++                      "video backend left alone")
++            return False
++    except ImportError:
++        pass
++
++    decord_reader = mod.VIDEO_READER_BACKENDS.get("decord")
++    if decord_reader is None:
++        raise RuntimeError("no decord reader in VIDEO_READER_BACKENDS; pip install decord")
++    try:
++        import decord  # noqa: F401
++    except ImportError as e:
++        raise RuntimeError("decord is not installed; video cannot be decoded") from e
++
++    if getattr(mod.VIDEO_READER_BACKENDS.get("torchvision"), "_locateanything_video", False):
++        if verbose:
++            print("locateanything_fix: video decode already redirected")
++        return False
++
++    def _redirected(ele):
++        return decord_reader(ele)
++    _redirected._locateanything_video = True
++    mod._orig_read_video_torchvision = mod.VIDEO_READER_BACKENDS["torchvision"]
++    mod.VIDEO_READER_BACKENDS["torchvision"] = _redirected
++    if hasattr(mod, "get_video_reader_backend"):
++        try:
++            mod.get_video_reader_backend.cache_clear()
++        except Exception:
++            pass
++    if verbose:
++        print("locateanything_fix: video decode redirected to decord "
++              "(torchvision.io.read_video was removed in torchvision 0.19)")
++    return True
++
++
+ def _is_single_sequence(cu_seqlens, seq_length) -> bool:
+     """True only for the conventional single-sequence form.
+ 

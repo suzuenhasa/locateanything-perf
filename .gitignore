@@ -1,0 +1,33 @@
+# Weights and model source live on the box / on HuggingFace, never here.
+*.safetensors
+*.bin
+*.pt
+vendor/
+
+# Test photographs are third-party stock (one carries a Dreamstime watermark)
+# and the renders derive from them.
+*.png
+*.jpg
+*.jpeg
+*.jfif
+# ...except the README demo assets. These are renders over third-party stock
+# photos (panel_006 carries a TopTropicals watermark) -- fine while this repo is
+# private, worth re-sourcing before making it public.
+!assets/*
+
+# The prebuilt flash-attn wheel is 55 MB — too big to version, and only valid
+# for one exact stack. wheels/README.md documents it; RUNBOOK.md has the recipe.
+wheels/*.whl
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Scratch benchmark output, but keep results/ — those JSONs are the raw data
+# behind the numbers in FINDINGS.md and are a few KB each.
+*.json
+!results/*.json
+
+__pycache__/
+*.pyc
