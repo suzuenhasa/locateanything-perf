@@ -54,6 +54,23 @@ cards as shipped.
 
 AP delta −0.0011 / −0.0021 against a shipped-vs-shipped control of 0.0000.
 
+### reproduced six months later
+
+Re-ran `crossbox.py` on 2026-08-20 on a fresh H100 PCIe, torch 2.11.0+cu128, no
+flash-attn — a different machine from the August run:
+
+| patches | stock (Aug) | stock (Aug 20) | fixed (Aug) | fixed (Aug 20) |
+|---|---|---|---|---|
+| 5,476 | 2.86s / **4491 MB** | 3.24s / **4491 MB** | 0.52s / **1389 MB** | 0.72s / **1389 MB** |
+| 10,000 | 3.73s / **14483 MB** | 4.53s / **14483 MB** | 0.61s / **2448 MB** | 0.75s / **2448 MB** |
+| 14,400 | 5.79s / **29707 MB** | 6.63s / **29707 MB** | 1.12s / **3478 MB** | 0.87s / **3478 MB** |
+| 25,600 | **OOM** 39.06 GiB | **OOM** 39.06 GiB | 4.02s / **6127 MB** | 3.92s / **6127 MB** |
+
+**Every memory figure is byte-identical**, on different hardware six months
+apart, including the OOM boundary. The kernel probe matches too — 898x at 14,400
+patches both times. Wall-clock differs (this box is PCIe, the August one was
+likely SXM) and today's speedups are better: 4.5x / 6.0x / 7.6x.
+
 ## video demo
 
 ![kitten detection](assets/video_demo.gif)
