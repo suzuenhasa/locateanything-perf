@@ -66,8 +66,20 @@ flash-attn — a different machine from the August run:
 | 14,400 | 5.79s / **29707 MB** | 6.63s / **29707 MB** | 1.12s / **3478 MB** | 0.87s / **3478 MB** |
 | 25,600 | **OOM** 39.06 GiB | **OOM** 39.06 GiB | 4.02s / **6127 MB** | 3.92s / **6127 MB** |
 
-**Every memory figure is byte-identical**, on different hardware six months
-apart, including the OOM boundary. The kernel probe matches too — 898x at 14,400
+Also run on an **A100 80GB (sm_80)** the same day:
+
+| patches | stock | fixed | speedup |
+|---|---|---|---|
+| 5,476 | 1.42s / **4491 MB** | 0.26s / **1388 MB** | 5.5x |
+| 10,000 | 2.45s / **14483 MB** | 0.41s / **2449 MB** | 6.0x |
+| 14,400 | 4.86s / **29707 MB** | 0.62s / **3478 MB** | 7.8x |
+| 25,600 | **OOM** 39.06 GiB | 1.36s / **6127 MB** | — |
+
+So the defect now has **three architectures** — sm_80, sm_86, sm_90 — with the
+same allocations and the same OOM boundary in every one.
+
+**Every memory figure is byte-identical**, across three GPU generations and on
+different hardware six months apart, including the OOM boundary. The kernel probe matches too — 898x at 14,400
 patches both times. Wall-clock differs (this box is PCIe, the August one was
 likely SXM) and today's speedups are better: 4.5x / 6.0x / 7.6x.
 
