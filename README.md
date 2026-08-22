@@ -54,7 +54,7 @@ cards as shipped.
 
 AP delta −0.0011 / −0.0021 against a shipped-vs-shipped control of 0.0000.
 
-### reproduced six months later
+### reproduced
 
 Re-ran `crossbox.py` on 2026-08-20 on a fresh H100 PCIe, torch 2.11.0+cu128, no
 flash-attn — a different machine from the August run:
