@@ -1,10 +1,10 @@
-# Benchmark & harness scripts for `locateanything-perf`
+# Runtime scripts for `locateanything-perf`
 
 All confirmed working on an RTX 3090 (24 GB), torch 2.11.0+cu128,
 transformers 4.57.1, `nvidia/LocateAnything-3B` in bf16.
 
-Every script takes `--model` (or `BASE_DIR`); nothing is hardcoded to a machine.
-`locateanything_fix` must be importable — `pip install -e .` or
+Every script takes `--model` (or `LA_MODEL`); nothing is hardcoded to a machine.
+`locateanything_fix` must be importable -- `pip install -e .` or
 `PYTHONPATH=/path/to/locateanything-perf`.
 
 ## Scripts
@@ -13,11 +13,18 @@ Every script takes `--model` (or `BASE_DIR`); nothing is hardcoded to a machine.
 |---|---|
 | `setup.sh` | venv + torch + pinned deps + `pip install -e` the patch + model download. `./setup.sh [BASE_DIR] [PATCH_REPO_DIR]` |
 | `verify_patch.py` | patch is live on the real code path, and numerically equivalent to the original. Exit 0/1, so it works as a CI gate |
-| `ab_sweep.py` | the main A/B harness: stock vs fixed over a directory of images x N queries -> panels, CSV, summary |
-| `batchbench.py` | throughput sweep across batch sizes and fix combinations in the batch engine |
-| `batch_video.py` | batched detection over a frame directory; writes `ab_sweep`-shaped JSONL |
-| `mkvideo.py` | draws per-frame boxes and re-encodes to mp4; supports detect-low / render-high via `--hold` |
-| `segcheck.py` | proves whether the packed multi-image branch of `_sdpa_attention_4d` actually executes |
+| `serve.py` | resident engine: load, patch, compile and warm once, then serve pages warm |
+| `tile_ocr.py` | tile a page, OCR the tiles as one batch, stitch the boxes back |
+| `crossbox.py` | one command per machine, output directly comparable: the kernel probe (no weights needed) plus the end-to-end run |
+| `la_common.py` | prompt templates, output parsing, resize maths. Imported by the two above; not run directly |
+
+That is the whole runtime, plus `crossbox.py` -- which is measurement, but it is
+the measurement anyone verifying the claim will want to run first, so it ships.
+The 28 scripts that produced the rest of the numbers -- A/B sweeps, decode-budget
+probes, the task matrix, the SGLang bench, the video pipeline -- are evidence
+tooling, not tooling for using the fix, and stay out of the repo. Nothing here
+imports them; the handful of helpers they shared with `serve.py` and `tile_ocr.py`
+is now `la_common.py`.
 
 ## Typical use
 
@@ -31,48 +38,95 @@ export LA_MODEL="$PWD/model"                       # or just use the hub id
 
 python locateanything-perf/scripts/verify_patch.py --model "$LA_MODEL"
 
-# images: stock vs fixed
-python ab_sweep.py --images ./inbox --queries "cat,kitten" --out ./results
+# a directory of pages, model stays resident
+python locateanything-perf/scripts/serve.py --bench ./inbox --task OCR
 
-# video: extract -> batched detect -> render (detect at 5fps, hold x6, render 30fps)
-ffmpeg -i clip.mp4 -vf "fps=5,scale=384:-2" -q:v 3 frames/f%04d.jpg
-python batch_video.py --frames ./frames --query "black cat" --batch-size 16 \
-                      --out ./raw.jsonl
-python mkvideo.py --frames ./frames --render-frames ./frames_full \
-                  --results ./raw.jsonl --query "black cat" --fps 30 --hold 6 --out out.mp4
+# one dense page, tiled
+python locateanything-perf/scripts/tile_ocr.py --image ./page.jpg --grid 3x3
 ```
 
-## ab_sweep.py flags
+## Serving pages warm (`serve.py`)
 
-| flag | default | what it does |
+```bash
+python serve.py --bench ./inbox --compile --warmup 6 --temperature 0
+python serve.py --bench ./inbox --no-compile           --temperature 0   # control
+python serve.py --bench ./inbox --compile --warmup 6 --strict            # staging
+```
+
+| | s/page | ms/forward | startup |
+|---|---|---|---|
+| eager | 5.61 | 50.59 | 7 s |
+| compiled | **4.68** | **39.82** | 178 s |
+
+Break-even is ~185 pages. For fewer than that in one process, pass `--no-compile`.
+
+Three flags exist because without them the benchmark lies:
+
+- **`--temperature 0`.** Sampling makes the same page emit 39-112 boxes. No A/B
+  on wall seconds survives that. Greedy is bit-reproducible: identical box and
+  forward counts on every round.
+- **`--tile-mode raw`** (the default). Tiles used to be padded to a canonical
+  448x448 for "shape stability", which was wrong -- the vision tower runs
+  outside the compiled region, so the padding stabilised nothing and cost 30%
+  linear resolution. Raw crops are the same speed and find 12-18% more regions.
+  `pad` is kept only for comparison.
+- **`--strict`.** Sets dynamo's `fail_on_recompile` after warmup, so a shape
+  warmup missed raises instead of costing a live request 100 seconds.
+
+`--warmup N` feeds *heterogeneous* synthetic pages -- each tile region a
+different line count, across three aspect ratios. That matters: the dimension
+that varies is the batch, and it varies during decode as rows retire at
+`im_end`, so uniform warmup pages never trace B = 5,4,3,2,1. With density-only
+warmup the first real request still spent 101.7 s tracing; with this, recompiles
+are zero from round 0.
+
+Watch `gave_up`, not `graphs`. `counters["stats"]["unique_graphs"]` freezes when
+a code object hits `cache_size_limit` and then runs eager forever, so a delta of
+zero is indistinguishable from total failure.
+
+
+## Tiling a page (`tile_ocr.py`)
+
+```bash
+python tile_ocr.py --image ./page.jpg --grid 3x3 --modes whole,tiled-batch
+python tile_ocr.py --image ./pages/  --grid 2x3 --patches 10000 --overlap 48
+```
+
+Tiling is the single largest lever on dense pages, and it is not a resolution
+effect -- it is a region-count effect. The model emits one decode block per
+region it finds, so latency tracks how many regions land in one forward stack,
+not how many pixels went in. Splitting a page into a grid lets six small stacks
+run as one batch instead of one long serial stack.
+
+| A4 page, 2x3 | s | boxes |
+|---|---:|---:|
+| whole | 9.85 | 45 |
+| tiled-batch | **7.04** | **84** |
+
+Faster *and* it finds 87% more regions, because each tile gets more of the
+25,600-patch budget spent on its own text. On the densest pages in the corpus
+the gap reaches 2.9x (14.20 s whole, 4.94 s tiled).
+
+`--overlap 48` and `--iou 0.55` exist because boxes straddling a tile seam
+otherwise arrive twice, once truncated. Raise the overlap for pages with wide
+tables; the dedupe is IoU over the stitched-back page coordinates, so it costs
+nothing at inference time.
+
+### Ask for patches, not a short side
+
+`--short-side` is a trap above 1024. The processor rescales anything over
+`in_token_limit` (25,600 patches, `image_processing_locateanything.py:52`), and
+the short side that saturates that budget depends entirely on aspect ratio:
+
+| image | aspect | short side at 25,600 patches |
 |---|---|---|
-| `--images DIR` | *required* | folder of images (jpg/png/webp/jfif/bmp/gif/tif) |
-| `--queries "a,b,c"` | `cat` | comma-separated things to locate |
-| `--out DIR` | `./ab_results` | output directory |
-| `--model PATH` | `$LA_MODEL`, else the hub | local path or HF id |
-| `--arms` | `stock,fixed` | which arms to run |
-| `--fixes` | `sdpa,logits,cache` | which fixes the fixed arm uses — **A/B one at a time** |
-| `--limit N` | all | only the N smallest images, for a quick check |
-| `--frame-threshold` | `0.90` | a box covering more than this is a whole-frame non-answer |
-| `--no-render` | off | data only, skip the panels |
-| `--seed` / `--max-new-tokens` / `--temperature` / `--top-p` | 1234 / 2048 / 0.7 / 0.9 | generation |
+| a 3.7:1 results table | 1500x407 | **1166 px** |
+| a 1.7:1 photo | 2048x1206 | 1718 px |
+| a 3:4 page | 1200x1600 | 1939 px |
 
-Outputs `panels/*.jpg`, `full_table.csv`, `results.json` (with box geometry),
-`summary.md` and `raw_*.jsonl`. It streams to JSONL and resumes, so an OOM that
-kills the process is retried rather than losing the sweep.
-
-## Three things that look like quirks and are not
-
-- **Each arm runs in its own subprocess.** `apply()` mutates module state, so a
-  fresh process is the only honest way to measure the stock arm, and it gives a
-  clean peak-memory number per arm.
-- **The loop is image-major** (all queries for one image, then the next) so the
-  vision cache can hit. Query-major evicts before reuse and scores zero hits,
-  which makes the cache look worthless.
-- **`do_sample` stays True.** Greedy never emits the End block on this model's MTP
-  paths and loops `<box><0><0><1000><1000></box>` to the token cap. Every image
-  then takes an identical "time to reach the cap", which looks like a clean result
-  table and is entirely fake.
+Ask for `--short-side 1680,2240` on the table and you get the same clamped run
+twice, in a table that looks fine. `--patches 5476,10000,14400,25600` puts every
+aspect ratio on the same rung and lines up with the top-level README's rows.
 
 ## Use plurals in your query
 
@@ -90,39 +144,49 @@ present. Measured over 30 frames that each contained two kittens:
 that matches the following description: ..."), which is presumably why it is the
 most stable. Easy to misread as the model failing to detect something.
 
-Note also that `mkvideo.py` labels boxes by their index within that frame, so
-"kitten 1" is not a stable identity across frames — there is no tracker here.
 
-## Video, end to end
-
-Detect on a downscaled low-fps pass, render on the full-rate one:
+## Reproducing the claim on another card (`crossbox.py`)
 
 ```bash
-mkdir -p frames frames_full
-ffmpeg -i clip.mp4 -vf "fps=10,scale=-2:384" -q:v 3 frames/f%04d.jpg   # detected
-ffmpeg -i clip.mp4 -vf "fps=30" -q:v 2 frames_full/f%04d.jpg           # drawn on
-
-python batch_video.py --frames ./frames --query "all the kittens" \
-                      --batch-size 16 --out ./raw.jsonl
-python mkvideo.py --frames ./frames --render-frames ./frames_full \
-                  --results ./raw.jsonl --query "all the kittens" \
-                  --fps 30 --hold 3 --out out.mp4
+python crossbox.py                                  # kernel probe only -- needs just torch
+python crossbox.py --model "$LA_MODEL" --out box.json   # also end-to-end
 ```
 
-`--hold` is output fps / detect fps, so 30/10 = 3. Detecting every frame at 30fps
-is mostly wasted; things do not move that fast.
+One command per machine, emitting the same measurements in the same shape, so a
+3090 result and an H100 result sit side by side without asterisks. It records
+driver, torch, CUDA and compute capability alongside every number, because "does
+this reproduce on newer torch" and "does 80 GB hide it" are both live questions
+that need the stack pinned to the figure.
 
-Measured on a 1920x1080 540-frame clip, 3090, all fixes on:
+Two things it does deliberately, both of which are easy to get wrong:
 
-| | fps=10 / hold 3 | fps=5 / hold 6 |
-|---|---|---|
-| detect frames | 134 | 67 |
-| detect wall | 23.5s | **11.9s** |
-| peak | 9,511 MB | **8,948 MB** |
-| boxes/frame | 1.96 | 1.94 |
+- **Equal patch counts, not equal pixel sizes.** The defect scales with patches^2,
+  so "a 1680px image" is different work at different aspect ratios. Every arm is
+  defined by a target patch count, and the script reports the count it achieved.
+- **Peak memory *above* resident weights.** Absolute peak conflates the model
+  (identical everywhere) with the activation cost (the thing being measured), and
+  cards with more VRAM let the allocator behave differently.
 
-Halving the detection rate cost almost nothing on this footage, but `--hold 6`
-holds a box for 200ms, so fast motion will show visible lag.
+Every memory figure matched across a 3090, an H100 PCIe and an A100 80GB,
+including the OOM boundary at 39.06 GiB. That byte-identical agreement across
+three cards is the check that the protocol measures what it claims to.
+
+## Traps
+
+Four ways to get a clean-looking result table that is entirely fake.
+
+- **Patching the model directory does nothing on its own.** `trust_remote_code`
+  executes a copy under `HF_HOME/modules/transformers_modules/`. Clear it, or the
+  edit never runs and you get a perfectly clean null result.
+- **`apply()` mutates module state.** Anything running a stock arm and a fixed
+  arm in one process must `revert()` between them, or arm 2 inherits arm 1.
+- **`do_sample=False` never terminates.** Greedy never emits the End block on
+  this model's MTP paths and loops `<box><0><0><1000><1000></box>` to
+  `max_new_tokens`. Every image then takes an identical "time to reach the cap".
+  `serve.py`'s `--temperature 0` handles this correctly; naive `do_sample=False`
+  does not.
+- **Use a control arm.** Run shipped-vs-shipped as a third arm; if it is not
+  exactly 0.0000, the comparison is uncalibrated.
 
 
 ## Findings that belong in the repo's own README
@@ -130,7 +194,7 @@ holds a box for 200ms, so fast motion will show visible lag.
 **1. The packed multi-image branch is no longer dead.** The NOTE at
 `locateanything_fix.py:125-130` says nothing reaches it. True by default — but
 `enable_packed_vision()` is exactly the caller the last sentence anticipates.
-Measured with `segcheck.py`, 8 images through `batch_utils`:
+Measured with `archive/scripts/segcheck.py`, 8 images through `batch_utils`:
 
 ```
 packed OFF   segments-per-call: {1: 216}    216 calls (27 layers x 8 images), all single-sequence
@@ -171,7 +235,7 @@ a line next to it.
 `_locateanything_sdpa_4d` attribute, so `is_applied()` goes False and
 `enable_packed_vision()` refuses with "call apply() first". The fix still *runs*
 (the wrapper delegates to it); only the gating breaks. Copy the marker onto any
-wrapper — `segcheck.py` shows the pattern. The loud failure is good design; it
+wrapper — `archive/scripts/segcheck.py` shows the pattern. The loud failure is good design; it
 just needs documenting.
 
 **5. `requirements-model.txt` understates decord.** The note says decord/lmdb/

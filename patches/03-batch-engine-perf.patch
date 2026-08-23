@@ -1,0 +1,230 @@
+--- engine_hybrid.py.orig	2026-08-23 10:32:44.143052130 -0400
++++ engine_hybrid.py	2026-08-23 10:36:59.671862266 -0400
+@@ -13,6 +13,8 @@
+ import importlib
+ import os
+ 
++import numpy as np
++
+ import torch
+ 
+ 
+@@ -41,6 +43,12 @@
+ README_TOP_P = 0.9
+ README_REPETITION_PENALTY = 1.1
+ 
++# PERF switches. All default ON and all bit-identical to stock; set to "0" to
++# get the stock path back for an A/B without editing code.
++BATCH_KV_UNPACK = os.environ.get("LA_FLASH_BATCH_KV_UNPACK", "1") != "0"
++VECTOR_MTP_SUFFIX = os.environ.get("LA_FLASH_VECTOR_MTP_SUFFIX", "1") != "0"
++FUSE_TOKENIZE = os.environ.get("LA_FLASH_FUSE_TOKENIZE", "1") != "0"
++
+ _LAST_HYBRID_STATS = None
+ 
+ 
+@@ -81,6 +89,55 @@
+     return tuple(packed), kvalid, lengths, kmax
+ 
+ 
++def _unpack_stock_rows_batched(out_kv, old_lens, uncached_lens, kmax, umax, dev):
++    """Batched replacement for the per-row _unpack_stock_after_forward loop.
++
++    Stock calls _unpack_stock_after_forward once per ROW, and each call walks
++    all 36 layers doing two slices and a torch.cat. At 48 rows that is 3,456
++    cat launches and ~6,900 slice views per forward -- 8-9% of wall. It is
++    dispatch-bound, not bandwidth-bound: shrinking head_dim 128->1 (1/128 the
++    bytes, identical op count) barely moves it.
++
++    Here the row-dependent part -- which source positions each row keeps -- is
++    built ONCE as an index tensor and reused for every layer, so per-layer work
++    is a single gather instead of B cats.
++
++    MEMORY: this holds [B, H, kept_max, D] per layer where the stock loop held
++    sum(kept). With ragged rows that is MORE memory, not less. It is a latency
++    change and NOT a fix for the 4.7x KV over-hold, which lives in
++    _pack_stock_kv_rows.
++    """
++    n = len(old_lens)
++    kept = [old_lens[i] + uncached_lens[i] for i in range(n)]
++    kept_max = max(kept) if kept else 0
++    if kept_max == 0:
++        return [tuple((k[i : i + 1, :, :0, :], v[i : i + 1, :, :0, :])
++                      for k, v in out_kv) for i in range(n)]
++
++    idx_np = np.zeros((n, kept_max), dtype=np.int64)
++    for i in range(n):
++        parts = []
++        if old_lens[i]:
++            parts.append(np.arange(kmax - old_lens[i], kmax, dtype=np.int64))
++        if uncached_lens[i]:
++            u0 = kmax + (umax - uncached_lens[i])
++            parts.append(np.arange(u0, kmax + umax, dtype=np.int64))
++        if parts:
++            row = np.concatenate(parts)
++            idx_np[i, : len(row)] = row
++    idx = torch.from_numpy(idx_np).to(dev, non_blocking=True)
++
++    per_row = [[] for _ in range(n)]
++    for k, v in out_kv:
++        ii = idx.view(n, 1, kept_max, 1).expand(-1, k.shape[1], -1, k.shape[3])
++        gk = k.gather(2, ii)
++        gv = v.gather(2, ii)
++        for i in range(n):
++            per_row[i].append((gk[i : i + 1, :, : kept[i], :],
++                               gv[i : i + 1, :, : kept[i], :]))
++    return [tuple(r) for r in per_row]
++
++
+ def _unpack_stock_after_forward(out_kv, local_row, old_len, uncached_len, kmax, umax):
+     """Keep old real KV plus the right-aligned uncached real tokens; drop pads/window."""
+     out = []
+@@ -939,15 +996,32 @@
+             _set_last_hybrid_stats(_stats)
+         return outs
+ 
++    # PERF: _tokenize() runs the FULL processor per row -- MoonViT CPU image
++    # preprocessing plus a pixel_values host-to-device transfer -- then throws
++    # all of it away except input_ids[0]. _encode_images() below then
++    # preprocesses every image a second time. ~34 ms/forward (5% of wall) at
++    # 48 rows of pure duplicate work.
++    #
++    # The path that avoids it already existed but was gated on the CALLER
++    # supplying vision_features. Encoding first makes the token count known, so
++    # the same path applies when the caller did not: _tokenize_cached_image
++    # expands the placeholder from the feature length, which is exactly what
++    # the processor computes.
++    vit_list = (
++        list(vision_features)
++        if vision_features is not None
++        else (_encode_images([im for im, _ in pairs]) if FUSE_TOKENIZE else None)
++    )
++    _tok_src = vision_features if vision_features is not None else vit_list
+     use_cached_tokenize = (
+-        vision_features is not None
++        _tok_src is not None
+         and os.environ.get("LA_FLASH_CACHE_TOKENIZE", "1") != "0"
+     )
+     if use_cached_tokenize:
+         try:
+             prompt_ids = [
+                 _tokenize_cached_image(q, int(v.shape[0]), im=im)
+-                for (im, q), v in zip(pairs, vision_features)
++                for (im, q), v in zip(pairs, _tok_src)
+             ]
+         except Exception as exc:
+             if os.environ.get("LA_FLASH_CACHE_TOKENIZE_STRICT", "0") == "1":
+@@ -957,11 +1031,8 @@
+             prompt_ids = [_tokenize(im, q) for im, q in pairs]
+     else:
+         prompt_ids = [_tokenize(im, q) for im, q in pairs]
+-    vit_list = (
+-        list(vision_features)
+-        if vision_features is not None
+-        else _encode_images([im for im, _ in pairs])
+-    )
++    if vit_list is None:
++        vit_list = _encode_images([im for im, _ in pairs])
+     lengths = [int(p.numel()) for p in prompt_ids]
+     bsz = len(pairs)
+     _record_group_stats(_stats, bsz)
+@@ -1121,24 +1192,60 @@
+     suf_pos = torch.ones((len(rows), seq_len), dtype=torch.long, device=dev)
+     q_valid = torch.zeros((len(rows), seq_len), dtype=torch.long, device=dev)
+ 
+-    for i, r in enumerate(rows):
+-        uncached = full_ids[r][cached_lens[r] :]
+-        left = umax - len(uncached)
+-        if uncached:
+-            suf_ids[i, left : left + len(uncached)] = torch.tensor(uncached, dtype=torch.long, device=dev)
+-            suf_pos[i, left : left + len(uncached)] = torch.arange(
+-                cached_lens[r], len(full_ids[r]), dtype=torch.long, device=dev)
+-            q_valid[i, left : left + len(uncached)] = 1
+-
+-        rep = full_ids[r][-1]
+-        cur_len = len(full_ids[r])
+-        suf_ids[i, umax] = rep
+-        suf_pos[i, umax] = cur_len - 1
+-        q_valid[i, umax] = 1
+-        for j in range(1, N_FUTURE):
+-            suf_ids[i, umax + j] = mask_tok
+-            suf_pos[i, umax + j] = cur_len + (j - 1)
+-            q_valid[i, umax + j] = 1
++    # PERF: the stock form below is a python double loop issuing ~1,100 CUDA
++    # ops per forward at 48 rows -- 864 of them scalar stores of values that
++    # are constant or affine in the row length, plus one h2d transfer and one
++    # device arange PER ROW. Measured at ~14 ms/forward. The vectorised branch
++    # is the same arithmetic, batched, and bit-identical: note the left-pad
++    # regions must keep their init values (pad / 1 / 0), because stock leaves
++    # suf_pos's left pad at its torch.ones init.
++    n_rows = len(rows)
++    if not VECTOR_MTP_SUFFIX:
++        for i, r in enumerate(rows):
++            uncached = full_ids[r][cached_lens[r] :]
++            left = umax - len(uncached)
++            if uncached:
++                suf_ids[i, left : left + len(uncached)] = torch.tensor(uncached, dtype=torch.long, device=dev)
++                suf_pos[i, left : left + len(uncached)] = torch.arange(
++                    cached_lens[r], len(full_ids[r]), dtype=torch.long, device=dev)
++                q_valid[i, left : left + len(uncached)] = 1
++            rep_tok = full_ids[r][-1]
++            cur_len = len(full_ids[r])
++            suf_ids[i, umax] = rep_tok
++            suf_pos[i, umax] = cur_len - 1
++            q_valid[i, umax] = 1
++            for j in range(1, N_FUTURE):
++                suf_ids[i, umax + j] = mask_tok
++                suf_pos[i, umax + j] = cur_len + (j - 1)
++                q_valid[i, umax + j] = 1
++    else:
++        if umax > 0:
++            ids_np = np.full((n_rows, umax), pad, dtype=np.int64)
++            pos_np = np.ones((n_rows, umax), dtype=np.int64)
++            val_np = np.zeros((n_rows, umax), dtype=np.int64)
++            for i, r in enumerate(rows):
++                c0 = cached_lens[r]
++                unc = full_ids[r][c0:]
++                if not unc:
++                    continue
++                left = umax - len(unc)
++                ids_np[i, left:] = unc
++                pos_np[i, left:] = np.arange(c0, len(full_ids[r]), dtype=np.int64)
++                val_np[i, left:] = 1
++            suf_ids[:, :umax] = torch.from_numpy(ids_np).to(dev, non_blocking=True)
++            suf_pos[:, :umax] = torch.from_numpy(pos_np).to(dev, non_blocking=True)
++            q_valid[:, :umax] = torch.from_numpy(val_np).to(dev, non_blocking=True)
++        cur = torch.tensor([len(full_ids[r]) for r in rows],
++                           dtype=torch.long, device=dev)
++        suf_ids[:, umax] = torch.tensor([full_ids[r][-1] for r in rows],
++                                        dtype=torch.long, device=dev)
++        if N_FUTURE > 1:
++            suf_ids[:, umax + 1 :] = mask_tok
++        # position umax is cur-1, and umax+j (j>=1) is cur+(j-1); both are
++        # (cur-1)+j, so one broadcast covers the whole window.
++        suf_pos[:, umax:] = (cur - 1).unsqueeze(1) + torch.arange(
++            N_FUTURE, dtype=torch.long, device=dev)
++        q_valid[:, umax:] = 1
+ 
+     full_mask = torch.cat([kvalid, q_valid], dim=1)
+ 
+@@ -1183,10 +1290,17 @@
+         image_token_index=img_tok if visual_features is not None else None,
+         logits_slice=slice(-N_FUTURE, None))
+ 
+-    for i, r in enumerate(rows):
+-        kv_rows[r] = _unpack_stock_after_forward(
+-            out.past_key_values, i, old_lens[i], uncached_lens[i], kmax, umax)
+-        cached_lens[r] = len(full_ids[r])
++    if BATCH_KV_UNPACK:
++        _packed = _unpack_stock_rows_batched(
++            out.past_key_values, old_lens, uncached_lens, kmax, umax, dev)
++        for i, r in enumerate(rows):
++            kv_rows[r] = _packed[i]
++            cached_lens[r] = len(full_ids[r])
++    else:
++        for i, r in enumerate(rows):
++            kv_rows[r] = _unpack_stock_after_forward(
++                out.past_key_values, i, old_lens[i], uncached_lens[i], kmax, umax)
++            cached_lens[r] = len(full_ids[r])
+ 
+     wlogits = out.logits[:, -N_FUTURE:, :]
+     local_prompts = [prompt_ids[r] for r in rows]

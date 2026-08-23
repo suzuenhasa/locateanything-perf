@@ -25,9 +25,22 @@ dist/
 *.egg-info/
 
 # Scratch benchmark output, but keep results/ — those JSONs are the raw data
-# behind the numbers in FINDINGS.md and are a few KB each.
+# behind the measured numbers and are a few KB each.
 *.json
 !results/*.json
 
 __pycache__/
 *.pyc
+
+# local test inputs, not part of the repo
+inbox/
+
+# The measurement archive: the harness that produced every number quoted below,
+# the working record, and the upstream-report drafts. Evidence tooling, not
+# tooling for using the fix. Nothing in scripts/ imports it -- the helpers it did
+# own were lifted into scripts/la_common.py.
+#
+# It is also a git repo of its own, with no remote. That is deliberate: ignored
+# here means it is never pushed, and nested means `git clean -xdf` will not
+# recurse into it. Only `git clean -ffdx` can destroy it.
+archive/

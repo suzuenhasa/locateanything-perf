@@ -1,0 +1,22 @@
+--- locate_anything.py.orig	2026-08-23 05:48:57.687053224 -0400
++++ locate_anything.py	2026-08-23 05:48:57.846824829 -0400
+@@ -199,6 +199,19 @@
+             )
+ 
+             if is_vision_weight:
++                # MoonViT's attention is wrapped in SGLang's VisionAttention,
++                # whose sub-modules are named attn.qkv_proj / attn.proj, while
++                # the HF checkpoint calls them wqkv / wo. Without this rename
++                # all 54 vision-attention tensors (27 blocks x {wqkv, wo}) miss
++                # params_dict, log one warning each, and are left at random
++                # init -- the tower still loads its MLP and norms, so the server
++                # comes up healthy and every request returns a full-image box
++                # <0><0><1000><1000> because the model never sees the image.
++                # kimi_vl.py:266-269 already does exactly this for the same
++                # encoder; this port omitted it.
++                name = name.replace("wqkv.", "attn.qkv_proj.").replace(
++                    "wo.", "attn.proj."
++                )
+                 if name.endswith(".bias") and name not in params_dict:
+                     continue
+                 if name not in params_dict:

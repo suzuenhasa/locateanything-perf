@@ -54,9 +54,24 @@ cards as shipped.
 
 AP delta −0.0011 / −0.0021 against a shipped-vs-shipped control of 0.0000.
 
+### these are all Detection prompts
+
+Every number above is `Locate all the instances that matches ...`, which emits a
+handful of boxes. The demo has four other task types and the model card
+documents three more, and the speedup on them depends almost entirely on how
+much the model has to say: 4.7x on GUI grounding, 3.6x on pointing, **1.4x on
+OCR**, because a dense page spends its time in ~400 decode steps that none of
+these fixes touch — and in the decode mode the demo actually uses for OCR, which
+measurably reads better, it is ~1.02x. What the fixes buy on OCR is headroom,
+not clock: stock OOMs on every cell above 10,000 patches, fixed completes all of
+them.
+
+Each of those is measured per task and split into vision / lm-prefill / decode.
+
 ### reproduced
 
-Re-ran `crossbox.py` on 2026-08-20 on a fresh H100 PCIe, torch 2.11.0+cu128, no
+Re-ran [`scripts/crossbox.py`](scripts/crossbox.py) on 2026-08-20 on a fresh
+H100 PCIe, torch 2.11.0+cu128, no
 flash-attn — a different machine from the August run:
 
 | patches | stock (Aug) | stock (Aug 20) | fixed (Aug) | fixed (Aug 20) |
@@ -127,10 +142,14 @@ locateanything_fix.enable_video_decode()                  # video
 keep the model resident — load is 4.04s and the first inference is 2x steady
 (1.19s vs 0.59s).
 
-## a/b testing script
+## running it
 
 ```bash
-python scripts/ab_sweep.py --images ./kitty --queries "cats" --out ./results
+python scripts/verify_patch.py --model /path/to/LocateAnything-3B   # confirm the fix is live
+python scripts/serve.py       --model /path/to/LocateAnything-3B --bench ./images
+python scripts/tile_ocr.py    --model /path/to/LocateAnything-3B --image ./page.jpg
 ```
 
-panels, csv, json, summary. flags and gotchas in [scripts/README.md](scripts/README.md).
+`serve.py` keeps the model resident and torch.compiled across requests; `tile_ocr.py`
+splits a page into a grid and dedupes the boxes, which is worth 2.9x on dense pages.
+Flags in [scripts/README.md](scripts/README.md).

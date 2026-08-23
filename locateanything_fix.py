@@ -65,7 +65,8 @@ from collections import OrderedDict
 import torch
 import torch.nn.functional as F
 
-__all__ = ["apply", "revert", "is_applied", "verify", "enable_vision_cache",
+__all__ = ["enable_batch_hostsync_fix", "disable_batch_hostsync_fix",
+           "apply", "revert", "is_applied", "verify", "enable_vision_cache",
            "enable_packed_vision", "enable_logits_slice", "disable_logits_slice",
            "enable_video_decode", "disable_video_decode", "VisionCache"]
 
@@ -97,7 +98,25 @@ def _is_single_sequence(cu_seqlens, seq_length) -> bool:
         return True
     if len(cu_seqlens) != 2:
         return False
-    return int(cu_seqlens[0]) == 0 and int(cu_seqlens[1]) == seq_length
+
+    # int() on a CUDA tensor is a host sync: the CPU stops queueing work until
+    # the GPU has drained everything outstanding. The ViT calls this once per
+    # layer with the SAME cu_seqlens object, so the naive form paid 2 syncs x 27
+    # layers = 54 drains per image -- measured at 141 ms, 5.4% of a single-image
+    # request, for a question whose answer cannot change between layers.
+    #
+    # Cache the answer on the tensor (it travels with the object, so there is no
+    # id-reuse hazard a dict would have) and read both entries in one transfer.
+    cached = getattr(cu_seqlens, "_la_single_seq", None)
+    if cached is not None and cached[0] == seq_length:
+        return cached[1]
+    lo, hi = cu_seqlens.tolist()
+    result = lo == 0 and hi == seq_length
+    try:
+        cu_seqlens._la_single_seq = (seq_length, result)
+    except Exception:
+        pass                      # not all tensor-likes accept attributes
+    return result
 
 
 def _sdpa_attention_4d(q, k, v, q_cu_seqlens=None, k_cu_seqlens=None):
@@ -129,7 +148,7 @@ def _sdpa_attention_4d(q, k, v, q_cu_seqlens=None, k_cu_seqlens=None):
         #
         # enable_packed_vision() is the caller this signature anticipates. With it
         # on, that same 8-image run collapses to 27 calls carrying 8 packed
-        # segments each -- scripts/segcheck.py measures exactly this. The two are
+        # segments each -- archive/scripts/segcheck.py measures exactly this. The two are
         # coupled: packing makes this branch live, and this branch is what makes
         # packing safe, since upstream refuses to pack without flash precisely
         # because the dense-mask path costs (sum S_i)^2 where this costs
@@ -536,6 +555,96 @@ def disable_video_decode(verbose: bool = True) -> bool:
     return True
 
 
+def enable_batch_hostsync_fix(verbose: bool = True) -> bool:
+    """Stop the batch engine re-reading every prompt off the GPU each step.
+
+        locateanything_fix.enable_batch_hostsync_fix()
+
+    `batch_utils.hybrid_runtime._pad_generated` rebuilds the padded
+    `[prompt + accepted]` matrix on every decode step, and does it by calling
+    `prompt_ids[b].tolist()` per row. The prompt does not change during
+    generation, but it is ~2,600 tokens for a page, so this is a full
+    GPU->host transfer of the prompt on every step of every row, and each one
+    is a pipeline drain. Measured at 1.9 ms/step, 123 ms (4.7%) of a
+    single-image request, and it scales with rows x prompt length.
+
+    The fix is to cache the python list per prompt tensor. Everything else --
+    the padding token, the ordering, the dtype -- is left exactly as upstream,
+    so the repetition-penalty behaviour the docstring there depends on is
+    unchanged.
+
+    Returns False if the engine is not importable or already patched.
+    """
+    try:
+        import batch_utils.hybrid_runtime as hr
+    except Exception as e:
+        if verbose:
+            print(f"locateanything_fix: batch engine not importable ({e})")
+        return False
+    orig = getattr(hr, "_pad_generated", None)
+    if orig is None or getattr(orig, "_la_hostsync", False):
+        return False
+
+    import torch
+
+    def _pad_generated_cached(prompt_ids, gen_ids, img_tok, dev):
+        rows = []
+        for b in range(len(prompt_ids)):
+            t = prompt_ids[b]
+            lst = getattr(t, "_la_prompt_list", None)
+            if lst is None:
+                lst = t.tolist()
+                try:
+                    t._la_prompt_list = lst
+                except Exception:
+                    pass
+            rows.append(lst + gen_ids[b])
+        M = max(len(r) for r in rows)
+        out = torch.full((len(rows), M), img_tok, dtype=torch.long, device=dev)
+        for b, r in enumerate(rows):
+            out[b, M - len(r):] = torch.tensor(r, dtype=torch.long, device=dev)
+        return out
+
+    _pad_generated_cached._la_hostsync = True
+    _pad_generated_cached._la_orig = orig
+    # engine_hybrid does `from .hybrid_runtime import _pad_generated`, which
+    # binds the name in ITS namespace at import time. Patching only the defining
+    # module is a silent no-op -- every real call site is in engine_hybrid.
+    targets = [hr]
+    try:
+        import batch_utils.engine_hybrid as eh
+        if getattr(eh, "_pad_generated", None) is not None:
+            targets.append(eh)
+    except Exception:
+        pass
+    for m in targets:
+        m._pad_generated = _pad_generated_cached
+    if verbose:
+        print(f"locateanything_fix: batch engine prompt round-trip cached "
+              f"in {', '.join(m.__name__.split('.')[-1] for m in targets)}")
+    return True
+
+
+def disable_batch_hostsync_fix(verbose: bool = True) -> bool:
+    try:
+        import batch_utils.hybrid_runtime as hr
+    except Exception:
+        return False
+    cur = getattr(hr, "_pad_generated", None)
+    if cur is None or not getattr(cur, "_la_hostsync", False):
+        return False
+    hr._pad_generated = cur._la_orig
+    try:
+        import batch_utils.engine_hybrid as eh
+        if getattr(eh, "_pad_generated", None) is cur:
+            eh._pad_generated = cur._la_orig
+    except Exception:
+        pass
+    if verbose:
+        print("locateanything_fix: batch engine prompt round-trip restored")
+    return True
+
+
 def is_applied() -> bool:
     """Marker-identity check, with one sharp edge.
 
@@ -543,7 +652,7 @@ def is_applied() -> bool:
     logger, call counter -- yields a new object without the marker, so this
     reports False and enable_packed_vision() refuses with "call apply() first"
     while the fix is in fact still executing underneath the wrapper. Copy the
-    marker onto the wrapper (scripts/segcheck.py shows the pattern) if you need
+    marker onto the wrapper (archive/scripts/segcheck.py shows the pattern) if you need
     to instrument it.
     """
     mod = _find_vit_module()
