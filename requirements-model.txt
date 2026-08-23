@@ -1,0 +1,34 @@
+# Versions LocateAnything-3B's custom code actually needs. Not installed by
+# `pip install locateanything-fix` on purpose — see the note in pyproject.toml.
+#
+# torch: install FIRST, from the index matching your CUDA version, e.g.
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# torchvision must come from that same index. The PyPI build carries the right
+# version number but the wrong CUDA ABI, so pip considers the requirement
+# satisfied while torchvision::nms fails to register and AutoProcessor won't
+# import.
+
+transformers==4.57.1   # 5.x changed _check_and_adjust_attn_implementation's
+                       # signature; the model's custom code fails to construct
+accelerate
+huggingface_hub
+pillow
+numpy                  # NOT the model card's ==1.25.0 pin, which predates py3.12 wheels
+einops
+timm
+
+# opencv/lmdb are needed only so transformers' import scan of the custom code
+# passes; the image path never calls them.
+#
+# decord IS load-bearing if you touch video. The model defaults to the
+# "torchvision" video backend, and torchvision >= 0.19 removed io.read_video, so
+# decode fails outright with
+#     module 'torchvision.io' has no attribute 'read_video'
+# and the error is swallowed into a log line claiming a fallback to torchvision,
+# which is what just failed. locateanything_fix.enable_video_decode() repoints
+# that backend at the decord reader already sitting in the same module.
+opencv-python-headless
+decord
+lmdb
+requests
+peft

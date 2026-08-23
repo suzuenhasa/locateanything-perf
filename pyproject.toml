@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "locateanything-fix"
+version = "0.1.0"
+description = "Runtime performance fixes for nvidia/LocateAnything-3B"
+readme = "README.md"
+requires-python = ">=3.9"
+# torch and transformers are deliberately NOT declared. The correct torch build
+# depends on your CUDA version, and resolving it here would let pip replace a
+# working install with a mismatched one. transformers must be 4.57.x for this
+# model's custom code — see requirements-model.txt.
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/suzuenhasa/locateanything-perf"
+
+[tool.setuptools]
+py-modules = ["locateanything_fix"]
