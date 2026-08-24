@@ -98,23 +98,23 @@ order the traceback finds them.
    loop converts the cache to a tuple and back. 5.x removed the legacy tuple
    format along with both methods.
 
-   In modeling_qwen2.py the fix is simply to keep the Cache object, which is
-   what the shim was converting away from.
-
-   batch_utils/hybrid_runtime.py cannot do that, because its caller genuinely
-   needs the tuple view: engine_hybrid.py packs rows into a batch, right-aligns
-   and pads each row's KV, and slices the result apart again per row, all in
-   the (k, v)-per-layer representation. Left as a Cache object it fails one
-   frame later, and less legibly:
+   Simply keeping the Cache object is not enough, because one caller genuinely
+   needs the tuple view. batch_utils/engine_hybrid.py packs rows into a batch,
+   right-aligns and pads each row's KV, then slices the result apart again per
+   row -- all in the (k, v)-per-layer representation. Hand it a Cache and it
+   fails one frame further out, and less legibly:
 
        File "batch_utils/engine_hybrid.py", line 89, in _unpack_stock_after_forward
          for k, v in out_kv:
        ValueError: too many values to unpack (expected 2)
 
-   So hybrid_runtime.py converts in both directions at that one boundary --
-   5.x keeps the tensors on cache.layers[i].keys/.values, and update() on a
-   fresh DynamicCache initialises each layer -- and the batch engine is left
-   alone.
+   Both forwards are on that path -- hybrid_runtime.py's own for the magi and
+   la_flash backends, and the checkpoint's Qwen2ForCausalLM for sdpa, which is
+   the default -- so both convert in each direction. That preserves the 4.x
+   contract exactly: pass a Cache and get a Cache back, which is what
+   generate() does; pass tuples and get tuples back, which is what the batch
+   engine does. 5.x keeps the tensors on cache.layers[i].keys/.values, and
+   update() on a fresh DynamicCache initialises each layer.
 
    prepare_inputs_for_generation reads two more names off the cache that 5.x
    removed: `seen_tokens`, already a deprecated alias of get_seq_length(), and
@@ -185,7 +185,42 @@ changed runs -- from_pretrained keeps raising from a path you did not edit.
          self.is_causal = True
          self.attention_dropout = config.attention_dropout
  
-@@ -1050,10 +1060,11 @@
+@@ -1034,6 +1044,34 @@
+     "The bare Qwen2 Model outputting raw hidden-states without any specific head on top.",
+     QWEN2_START_DOCSTRING,
+ )
++def _cache_to_pairs(cache):
++    """Cache -> ((k, v), ...) per layer, i.e. the old legacy-tuple view.
++
++    transformers 5.x removed Cache.to_legacy_cache()/from_legacy_cache() along
++    with the tuple cache format, but this forward must still honour a caller
++    that hands it tuples -- batch_utils/engine_hybrid.py does, because it packs
++    rows into a batch, right-aligns and pads each row's KV, then slices the
++    result apart per row, all in that representation.
++
++    Converting in both directions keeps the 4.x contract exactly: pass a Cache
++    and get a Cache back (which is what generate() does), pass tuples and get
++    tuples back. 5.x keeps the tensors on cache.layers[i].keys/.values.
++    """
++    if hasattr(cache, "to_legacy_cache"):
++        return cache.to_legacy_cache()
++    return tuple((layer.keys, layer.values) for layer in cache.layers)
++
++
++def _cache_from_pairs(dynamic_cache_cls, pairs):
++    """The inverse. update() on a fresh DynamicCache initialises each layer."""
++    if hasattr(dynamic_cache_cls, "from_legacy_cache"):
++        return dynamic_cache_cls.from_legacy_cache(pairs)
++    cache = dynamic_cache_cls()
++    for layer_idx, (k, v) in enumerate(pairs):
++        cache.update(k, v, layer_idx)
++    return cache
++
++
+ class Qwen2PreTrainedModel(PreTrainedModel):
+     config_class = Qwen2Config
+     base_model_prefix = "model"
+@@ -1050,10 +1088,11 @@
              return config
          return super()._autoset_attn_implementation(config, *args, **kwargs)
  
@@ -199,7 +234,7 @@ changed runs -- from_pretrained keeps raising from a path you did not edit.
  
      def _init_weights(self, module):
          std = self.config.initializer_range
-@@ -1234,12 +1245,22 @@
+@@ -1234,12 +1273,17 @@
          past_key_values_length = 0
  
          if use_cache:
@@ -212,18 +247,22 @@ changed runs -- from_pretrained keeps raising from a path you did not edit.
              if use_legacy_cache:
                  if past_key_values is None:
                      past_key_values = DynamicCache()
--                else:
-+                elif hasattr(DynamicCache, "from_legacy_cache"):
-                     past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-+                else:
-+                    raise ValueError(
-+                        "past_key_values was passed as a legacy tuple, which this "
-+                        "version of transformers can no longer convert")
-+                use_legacy_cache = hasattr(DynamicCache, "to_legacy_cache")
+                 else:
+-                    past_key_values = DynamicCache.from_legacy_cache(past_key_values)
++                    past_key_values = _cache_from_pairs(DynamicCache, past_key_values)
              past_key_values_length = past_key_values.get_seq_length()
  
          if position_ids is None:
-@@ -1395,7 +1416,15 @@
+@@ -1382,7 +1426,7 @@
+ 
+         next_cache = None
+         if use_cache:
+-            next_cache = next_decoder_cache.to_legacy_cache() if use_legacy_cache else next_decoder_cache
++            next_cache = _cache_to_pairs(next_decoder_cache) if use_legacy_cache else next_decoder_cache
+ 
+         if not return_dict:
+             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+@@ -1395,7 +1439,15 @@
  
  
  class Qwen2ForCausalLM(Qwen2PreTrainedModel):
@@ -240,7 +279,7 @@ changed runs -- from_pretrained keeps raising from a path you did not edit.
  
      def __init__(self, config):
          super().__init__(config)
-@@ -1555,8 +1584,16 @@
+@@ -1555,8 +1607,16 @@
          if past_key_values is not None:
              if isinstance(past_key_values, Cache):
                  cache_length = past_key_values.get_seq_length()
