@@ -1,17 +1,55 @@
 # Runtime scripts for `locateanything-perf`
 
-All confirmed working on an RTX 3090 (24 GB), torch 2.11.0+cu128,
-transformers 4.57.1, `nvidia/LocateAnything-3B` in bf16.
+All confirmed working on an RTX 3090 (24 GB), `nvidia/LocateAnything-3B` in
+bf16.
 
 Every script takes `--model` (or `LA_MODEL`); nothing is hardcoded to a machine.
 `locateanything_fix` must be importable -- `pip install -e .` or
 `PYTHONPATH=/path/to/locateanything-perf`.
 
+## Versions
+
+```
+MINIMUMS:  torch >= 2.0     transformers >= 4.51     python >= 3.9
+MAXIMUMS:  none
+```
+
+Both minimums are upstream's, not this repo's, and there is no upper bound. If
+your stack clears them, nothing here asks you to change it.
+
+Tested end to end, same page, **byte-identical output at every point** (28
+boxes, 1,621 ref chars):
+
+| torch | CUDA | transformers |
+|---|---|---|
+| 2.6.0+cu124 | 12.4 | 4.51.3 |
+| 2.11.0+cu130 | 13.0 | 5.12.1 |
+| 2.13.0+cu132 | 13.2 | 5.15.1 |
+
+- **torch 2.0** is where `scaled_dot_product_attention` lands -- the one torch
+  API the checkpoint cannot do without, and transformers' own declared floor.
+  The checkpoint asserts no torch version at all.
+- **transformers 4.51** is where `models.qwen3` appears, which
+  `configuration_locateanything.py` and `modeling_locateanything.py` import at
+  module level for a branch this checkpoint never takes (its `architectures` is
+  `Qwen2ForCausalLM`). Lazy that import and the next wall is 4.45, at
+  `processing_utils.Unpack`.
+
+`patches/05-transformers5-compat.patch` is what removes the ceiling. The
+checkpoint's code assumes transformers 4.x in six places; five raise on 5.x and
+the sixth does not -- the rotary embedding's buffers are `persistent=False`, so
+they are absent from the checkpoint and 5.x materialises them from meta without
+writing to them (`inv_freq[:3] == [1.19e-26, 0.0, 0.0]`, should start at 1.0).
+`cos` goes non-finite, layer 0 is NaN on the first forward, and the model loads
+with every weight matching the safetensors and emits token soup. Applied
+unconditionally by `setup.sh` for that reason. Every hunk is guarded, so 4.x
+behaves exactly as it did before.
+
 ## Scripts
 
 | script | what it does |
 |---|---|
-| `setup.sh` | venv + torch + pinned deps + `pip install -e` the patch + model download. `./setup.sh [BASE_DIR] [PATCH_REPO_DIR]` |
+| `setup.sh` | checks the box, reuses or builds an environment, downloads the checkpoint, applies the patches, and refuses to claim success unless `verify_patch.py` passes |
 | `verify_patch.py` | patch is live on the real code path, and numerically equivalent to the original. Exit 0/1, so it works as a CI gate |
 | `serve.py` | resident engine: load, patch, compile and warm once, then serve pages warm |
 | `tile_ocr.py` | tile a page, OCR the tiles as one batch, stitch the boxes back |
@@ -26,23 +64,70 @@ tooling, not tooling for using the fix, and stay out of the repo. Nothing here
 imports them; the handful of helpers they shared with `serve.py` and `tile_ocr.py`
 is now `la_common.py`.
 
-## Typical use
+## Setup
 
 ```bash
 git clone https://github.com/suzuenhasa/locateanything-perf.git
-bash locateanything-perf/scripts/setup.sh          # BASE defaults to the repo's parent
+cd locateanything-perf
+bash scripts/setup.sh
+```
 
-source venv/bin/activate
-export PYTHONPATH="$PWD/locateanything-perf"
-export LA_MODEL="$PWD/model"                       # or just use the hub id
+It checks compute capability, VRAM, disk, DNS and outbound HTTPS, and the
+driver's CUDA version before installing anything, then ends by running
+`verify_patch.py` and refusing to claim success unless it prints
+`PATCH_VERIFIED`. Afterwards `source <BASE>/env.sh` sets `PYTHONPATH`,
+`LA_MODEL` and `HF_HOME`.
 
-python locateanything-perf/scripts/verify_patch.py --model "$LA_MODEL"
+| flag | what it does |
+|---|---|
+| *(none)* | environment, checkpoint, `patches/05`, verify |
+| `--check` | verify an existing install, change nothing. Exits non-zero on any problem, so it works as a CI gate |
+| `--fix-decode` | also apply `patches/04`, which makes in-process transcription correct. See the OCR section below |
+| `--sglang` | patch an SGLang **you already have** with `patches/02` (version-gated) and `patches/06` |
+| `<sshhost>` | copy this checkout to a remote machine over ssh and run there |
+
+### It installs as little as it can
+
+- **torch already present** -> used as-is at whatever version, no wheels
+  downloaded. It only installs torch if there is none.
+- **transformers at or above 4.51** -> left alone at whatever version. The only
+  version it will ever change is one below the floor, and it upgrades to the
+  minimum, not the latest, after saying why.
+- **an interpreter that already has both** -> reused rather than building a venv
+  beside the checkout and downloading several GB next to a working install.
+  `LA_NO_SYSTEM_PY=1` to opt out.
+- **SGLang** -> never installed. Installing it into a working environment drags
+  its own pinned torch over yours. `--sglang` patches one that is already
+  importable; if there is none, setup says so and stops.
+
+What it does have to fetch on a bare machine: the 7.3 GB checkpoint, and
+whichever of `accelerate peft einops timm decord lmdb opencv-python-headless`
+are missing.
+
+| variable | for |
+|---|---|
+| `LA_PY` | use this interpreter |
+| `LA_BASE` | where the venv, model and `env.sh` go |
+| `LA_MODEL` | a checkpoint you already have — skips the 7.3 GB download |
+| `LA_HF_HOME` | share an existing HF cache |
+| `TORCH_INDEX` | override the wheel index chosen from your driver's CUDA version |
+| `LA_SGLVENV` | build a separate SGLang venv here |
+| `LA_NO_SYSTEM_PY` | never reuse an interpreter off `PATH` |
+| `LA_UNPINNED` | take the checkpoint's current HEAD instead of the pinned revision |
+| `LA_SKIP_VERIFY` | skip the final `verify_patch.py` |
+
+## Typical use
+
+```bash
+source <BASE>/env.sh
+
+python scripts/verify_patch.py --model "$LA_MODEL"
 
 # a directory of pages, model stays resident
-python locateanything-perf/scripts/serve.py --bench ./inbox --task OCR
+python scripts/serve.py --bench ./inbox --task OCR
 
 # one dense page, tiled
-python locateanything-perf/scripts/tile_ocr.py --image ./page.jpg --grid 3x3
+python scripts/tile_ocr.py --image ./page.jpg --grid 3x3
 ```
 
 ## Serving pages warm (`serve.py`)
@@ -53,12 +138,38 @@ python serve.py --bench ./inbox --no-compile           --temperature 0   # contr
 python serve.py --bench ./inbox --compile --warmup 6 --strict            # staging
 ```
 
+Nine page scans, 2x3 tiles, `--temperature 0`, with `patches/04` applied so the
+text is correct:
+
 | | s/page | ms/forward | startup |
 |---|---|---|---|
-| eager | 5.61 | 50.59 | 7 s |
-| compiled | **4.68** | **39.82** | 178 s |
+| eager | 8.92 | 53.75 | 7.2 s |
+| compiled | **6.70** | **40.34** | 387.7 s cold / 181.5 s warm |
 
-Break-even is ~185 pages. For fewer than that in one process, pass `--no-compile`.
+`ms/forward` is the invariant unit and `patches/04` does not move it -- 53.75
+against 53.15 measured before the patch. Correct text is not a slower engine, it
+is more forwards.
+
+**`--compile` is paid on every process start, not once per machine.** It traces
+in memory; what survives is the on-disk inductor cache (~94 MB at
+`/tmp/torchinductor_$USER`), which halves the trace but does not remove it:
+
+| | startup | saves 2.22 s/page, so pays back at |
+|---|---:|---:|
+| first compile on a machine (cold cache) | 387.7 s | ~171 pages |
+| every later process start (warm) | 181.5 s | ~78 pages |
+| `--no-compile` | 7.2 s | n/a |
+
+If a process handles fewer than ~78 pages before exiting, `--no-compile` wins
+outright -- compile is for a long-lived `serve.py`, not a run that starts and
+stops. And if `/tmp` is not persistent where you are running (containers,
+scratch filesystems), point `TORCHINDUCTOR_CACHE_DIR` somewhere that is, or
+every start pays the cold price.
+
+Compile startup is a property of the machine, so measure it rather than trusting
+the number above. Holding hardware and torch fixed and changing only
+transformers, cold in both cases: 320.0 s / 26 graphs on 4.51.3 against
+387.7 s / 42 graphs on 5.12.1.
 
 Three flags exist because without them the benchmark lies:
 
@@ -103,14 +214,19 @@ at 10,000 patches:
 
 | 3x3 | s/page | 9 pages | regions |
 |---|---:|---:|---:|
-| whole | 7.98 | 71.8 | 423 |
-| tiled, one at a time | 14.00 | 126.0 | 858 |
-| tiled, batched | **5.06** | **45.5** | 836 |
+| whole | 17.86 | 160.7 | 347 |
+| tiled, batched | **10.14** | **91.3** | 869 |
 
-Faster *and* about twice the regions, because each tile gets the full
-25,600-patch budget spent on its own text. Batching the nine tiles rather than
-running them in sequence is worth 2.77x on its own -- that is the whole speed
-win, and it is why `tiled-seq` exists only as a control.
+Faster *and* about 2.5x the regions, because each tile gets the full
+25,600-patch budget spent on its own text. On one dense page with all three arms:
+whole 16.43 s, tiled one-at-a-time 35.23 s, tiled batched 12.53 s -- so batching
+the tiles rather than running them in sequence is worth **2.81x on its own**.
+That is the whole speed win, and it is why `tiled-seq` exists only as a control.
+
+(These are with `patches/04` applied. Before it the same corpus ran at 7.98 and
+5.06 s/page, but that was the model speculating six tokens of prose per forward
+and never checking them -- right boxes, mush words. Correct text costs about 2x;
+the ratio tiling buys is unaffected.)
 
 The direction is corpus-dependent and the counts say which case you are in. On
 pages the whole-page pass already reads competently, tiling costs about the same
@@ -212,18 +328,84 @@ Two things worth knowing before trusting an OCR number from this repo:
 SGLang has no parallel box decoder (`grep -c n_future` its `locate_anything.py`:
 zero) and gets its speed from batching across requests instead, so it cannot
 stutter. It matched `slow` exactly -- 28 regions, 1,618 chars against 1,619 --
-in 5.32s, and nine concurrent requests cost 7.43s against 5.32s for one.
+in 5.32s.
 
 Detection, grounding, pointing and GUI grounding are unaffected: their output is
 coordinates, which is what the parallel decoder is for. Only transcription is
-hit. `setup.sh --sglang` builds the serving venv and applies `patches/02`,
-without which the vision tower loads 54 tensors at random init and every box is
-the whole image.
+hit.
+
+### Three ways to be correct
+
+| | text | boxes | needs |
+|---|---|---|---|
+| locating only | n/a | correct | nothing beyond `apply()` |
+| some OCR | correct, ~17.9 s/page | correct | `setup.sh --fix-decode` |
+| OCR in volume | correct, ~1.35 s/page at 9 concurrent | correct | an SGLang install, then `setup.sh --sglang` |
+
+### How much slower is OCR without SGLang
+
+Nine **distinct** page scans, whole-page OCR, warm server. Distinct matters:
+sending the same page N times lets SGLang's radix cache serve the shared
+prefill, which inflates the result.
+
+| | 9 pages | per page |
+|---|---:|---:|
+| in-process, `patches/04` applied | 160.7 s | 17.90 s |
+| SGLang, one page at a time | 54.7 s | 6.08 s |
+| SGLang, 3 concurrent | 22.5 s | 2.50 s |
+| SGLang, 6 concurrent | 12.9 s | 1.44 s |
+| **SGLang, 9 concurrent** | **12.1 s** | **1.35 s** |
+
+Concurrency saturates around six -- past that the card is the limit, not the
+scheduler. End to end that is **13x**, from two gaps that compound: **2.9x per
+request**, because the model's decode loop runs at 21% of this card's
+memory-bandwidth roofline (31.5 ms/token) against SGLang's 73% (9.0 ms/token);
+and **4.5x across requests**, because the in-process engine serves pages one
+after another. It batches tiles *within* a page -- that is the 2.81x above --
+but it cannot overlap *pages*. That is the part you do not have without SGLang.
+
+`setup.sh` reports which of these paths you are on whether or not you pass
+`--sglang`, because nothing errors without it; pages are simply an order of
+magnitude slower and there is no reason to suspect it.
+
+### The two SGLang patches, one of which is version-dependent
+
+**`patches/06` is required.** `sglang/srt/models/kimi_vl_moonvit.py` is a
+verbatim vendoring of the checkpoint's `modeling_vit.py`, so it carries the same
+3-D SDPA defect `patches/01` fixes -- and `locateanything_fix.apply()` cannot
+reach it, because the server is a different process running a different module.
+Unpatched, the server loads clean, reports healthy, and dies on the first
+full-resolution page trying to allocate 10.62 GiB, taking the whole server with
+it. Launch with `LA_VIT_FASTMASK=1` or the patch is inert.
+
+**`patches/02` depends on your SGLang version, and both directions fail
+silently.** It renames the checkpoint's vision tensors (`wqkv`/`wo`) to the names
+older SGLang used (`attn.qkv_proj`/`attn.proj`). Newer SGLang renamed its *own*
+modules to match the checkpoint instead, so there the patch renames them **away**
+from the correct names -- and it still applies cleanly, which is the trap.
+Either way all 54 vision-attention tensors miss `params_dict` and stay at random
+init, the tower still loads its MLPs and norms, **the server comes up healthy**,
+and every box is the whole image `<0><0><1000><1000>`. Measured on sglang
+0.5.16: patched, 108 parameters did not receive weights; reverted, 0.
+
+`setup.sh --sglang` detects which way your build goes rather than assuming, and
+`--check` fails if `patches/02` is applied to one that does not want it.
 
 
 ## Traps
 
-Four ways to get a clean-looking result table that is entirely fake.
+Six ways to get a clean-looking result that is entirely fake.
+
+- **A model that loads is not a model that works.** On transformers 5.x without
+  `patches/05`, the rotary buffers come back as uninitialised memory. Nothing
+  raises: the model loads, every weight matches the safetensors byte for byte,
+  and the output is token soup. `verify_patch.py` covers the vision attention
+  numerically; it is the only check that runs the real code path.
+- **An SGLang server that reports healthy is not a server that sees the image.**
+  Get `patches/02` wrong in either direction and 54 vision tensors stay at random
+  init while the tower still loads its MLPs and norms. Every box comes back as
+  the whole image. Grep the launch log for `not found in params_dict` and
+  `did not receive weights`; both should be zero.
 
 - **Patching the model directory does nothing on its own.** `trust_remote_code`
   executes a copy under `HF_HOME/modules/transformers_modules/`. Clear it, or the

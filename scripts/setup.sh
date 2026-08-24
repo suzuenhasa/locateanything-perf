@@ -410,7 +410,28 @@ say "Weights (7.3 GB on a cold box — this is the slow part)"
 # transformers_modules copy behind after the checkout is replaced. LA_HF_HOME
 # overrides it for a deliberate shared cache.
 export HF_HOME="${LA_HF_HOME:-$BASE/hf}"
+# LA_MODEL points at a checkpoint you already have. Every script in this repo
+# reads that variable, and env.sh below exports it, but this script used to
+# ignore it -- so anyone with the 7.3 GB already on disk somewhere else
+# downloaded it a second time. It is honoured only if it looks like a real
+# checkout, so a stale or half-written path fails loudly instead of being
+# silently adopted.
 MODEL_DIR="$BASE/model"
+if [ -n "${LA_MODEL:-}" ]; then
+  case "$LA_MODEL" in
+    */*)
+      if [ -s "$LA_MODEL/config.json" ]; then
+        MODEL_DIR="$LA_MODEL"
+        ok "using the checkpoint already at $MODEL_DIR — not downloading"
+      else
+        die "LA_MODEL=$LA_MODEL has no config.json.
+       Point it at an unpacked checkpoint directory, or unset it to download
+       one to \$LA_BASE/model."
+      fi ;;
+    *)  # a bare hub id, e.g. nvidia/LocateAnything-3B -- not a local directory
+        warn "LA_MODEL=$LA_MODEL is a hub id, not a directory; downloading to $MODEL_DIR" ;;
+  esac
+fi
 mkdir -p "$HF_HOME"
 if [ "$CHECK" -eq 1 ]; then
   [ -s "$MODEL_DIR/config.json" ] || die "no weights at $MODEL_DIR"

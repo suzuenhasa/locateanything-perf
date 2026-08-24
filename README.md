@@ -102,7 +102,7 @@ Also run on an **A100 80GB (sm_80)** the same day:
 ```bash
 git clone https://github.com/suzuenhasa/locateanything-perf.git
 cd locateanything-perf
-bash scripts/setup.sh            # checks the box, installs, downloads, verifies
+bash scripts/setup.sh            # checks the machine, installs, downloads, verifies
 ```
 
 `setup.sh` checks the card, the driver's CUDA version, disk, and every pinned
@@ -324,9 +324,10 @@ memory; what survives is the on-disk inductor cache (94 MB at
 
 Two consequences worth knowing:
 
-- `/tmp` does not survive a new container. If you rent boxes, point the cache
-  somewhere that persists — `TORCHINDUCTOR_CACHE_DIR=/workspace/inductor` — or
-  every fresh instance pays the 388s cold price again.
+- The cache lives under `/tmp`, which is not persistent everywhere — containers
+  and scratch filesystems lose it. If that is your situation, point
+  `TORCHINDUCTOR_CACHE_DIR` somewhere that survives, or every start pays the
+  388s cold price again.
 - If your process handles fewer than ~78 pages before exiting, `--no-compile`
   wins outright. Compile is for a long-lived `serve.py`, not for a run that
   starts and stops.
