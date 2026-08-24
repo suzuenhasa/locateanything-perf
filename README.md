@@ -308,10 +308,23 @@ Serving the same nine pages with the model resident (`serve.py`, 2x3 tiles,
 is not a slower engine, it is more forwards: the model stops speculating six
 tokens of prose per pass and emits them one at a time.
 
-`--compile` is **1.33x per forward**, exactly as before, but startup grew from
-177s to 388s on this stack (42 graphs). It saves 2.22s/page against 380s of
-extra startup, so it now pays back at about **171 pages** in one process rather
-than 81. Below that, run `--no-compile`.
+`--compile` is **1.33x per forward**, exactly as before. It saves 2.22s/page
+against 380s of extra startup, so it pays back at about **171 pages** in one
+process. Below that, run `--no-compile`.
+
+That startup figure was 177s in an earlier version of this file, and the jump is
+mostly **not** the transformers version. Holding the box and torch fixed and
+changing only transformers:
+
+| transformers | compile startup | graphs | ms/forward |
+|---|---:|---:|---:|
+| 4.51.3 | 320.0s | 26 | 38.56 |
+| 5.12.1 | 387.7s | 42 | 40.34 |
+
+5.x traces 16 more graphs and costs 21% more startup — real, but not the
+difference between 177s and 388s. The 177s was measured on a different physical
+3090 and is not comparable; treat compile startup as something to measure on the
+box you are actually using, not a constant.
 
 ### OCR text quality needs SGLang
 
