@@ -125,34 +125,51 @@ need any of this if you are reading text in volume.
 **do not install flash-attn** — transformers picks `flash_attention_2` for the
 LM, qwen2 doesn't implement it, first forward dies.
 
-### versions — nothing here is pinned, and nothing needs upgrading
+### versions
 
-Verified end to end on this checkpoint, same page, **byte-identical output at
-every point** (28 boxes, 1,621 ref chars):
+```
+MINIMUMS:  torch >= 2.0     transformers >= 4.51     python >= 3.9
+MAXIMUMS:  none
+```
 
-| torch | CUDA | transformers | |
-|---|---|---|---|
-| 2.6.0+cu124 | 12.4 | 4.51.3 | oldest tested |
-| 2.11.0+cu130 | 13.0 | 5.12.1 | |
-| 2.13.0+cu132 | 13.2 | 5.15.1 | newest that exists |
+**Both minimums come from upstream, not from this repo, and there is no upper
+bound.** If your stack clears them, nothing here wants you to change it.
 
-The top row matters as much as the bottom one: **if your box already has a
-working torch, setup.sh uses it and downloads no wheels.** torch only ever
-needed 2.x, for `scaled_dot_product_attention`. There is no reason to upgrade a
-stack that works.
+`setup.sh` installs as little as it can:
 
-The floor is transformers **4.51**, and it is not ours: the checkpoint imports
-Qwen3 at module level for a branch it never takes — its own `architectures` are
-`Qwen2ForCausalLM` — and `transformers.models.qwen3` first ships in 4.51.0. Make
-that import lazy and the next wall is 4.45, where `processing_utils` grew
-`Unpack`.
+- torch already present → **used as-is, no wheels downloaded**, whatever version
+- transformers at or above 4.51 → **left alone**, whatever version
+- transformers below 4.51 → upgraded to the **minimum**, not the latest, and it
+  tells you why first
+- SGLang → **never installed**; it patches one you already have
 
-The ceiling used to be 4.57.1, because the checkpoint's custom code assumes
+Tested end to end, same page, **byte-identical output at every point** (28 boxes,
+1,621 ref chars):
+
+| torch | CUDA | transformers |
+|---|---|---|
+| 2.6.0+cu124 | 12.4 | 4.51.3 |
+| 2.11.0+cu130 | 13.0 | 5.12.1 |
+| 2.13.0+cu132 | 13.2 | 5.15.1 |
+
+Where the two floors come from:
+
+- **torch 2.0** is where `scaled_dot_product_attention` arrives — the one torch
+  API the checkpoint cannot do without. It is also transformers' own declared
+  floor. The checkpoint asserts no torch version at all.
+- **transformers 4.51** is where `models.qwen3` appears, which
+  `configuration_locateanything.py` and `modeling_locateanything.py` import at
+  module level for a branch this checkpoint never takes — its own
+  `architectures` is `Qwen2ForCausalLM`. Make that import lazy and the next wall
+  is 4.45, at `processing_utils.Unpack`.
+
+The ceiling used to be 4.57.1, because the checkpoint's code assumes
 transformers 4.x in six places. `patches/05-transformers5-compat.patch` makes
-all six version-agnostic, so 4.x still behaves exactly as before. Five of them
-raise; the sixth does not, which is why it is applied rather than offered — the
-rotary embedding's buffers are `persistent=False`, so they are absent from the
-checkpoint, and 5.x materialises them from meta **without writing to them**:
+all six version-agnostic — 4.x behaves exactly as before, and 5.x works. Five of
+the six raise; the sixth does not, which is why it is applied unconditionally
+rather than offered. The rotary embedding's buffers are `persistent=False`, so
+they are absent from the checkpoint, and 5.x materialises them from meta
+**without writing to them**:
 
 ```
 inv_freq[:3] == [1.19e-26, 0.0, 0.0]     # should start at 1.0
@@ -160,7 +177,7 @@ inv_freq[:3] == [1.19e-26, 0.0, 0.0]     # should start at 1.0
 
 `cos` is then non-finite and layer 0's attention is NaN on the first forward.
 The model loads, every weight matches the safetensors byte for byte, and it
-emits token soup. `setup.sh` applies patches/05 unconditionally.
+emits token soup.
 
 ## how to use
 

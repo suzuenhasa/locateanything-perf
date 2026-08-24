@@ -28,25 +28,28 @@ BASE="${LA_BASE:-$(dirname "$REPO")}"
 # to 4.57.1, on the strength of the first error 5.x produced. There are six,
 # they are all small, and patches/05 makes every one of them version-agnostic.
 #
+#   MINIMUMS:  torch >= 2.0     transformers >= 4.51     python >= 3.9
+#   MAXIMUMS:  none. Both floors come from upstream, not from this repo.
+#
 # Verified end to end on this checkpoint, same page, byte-identical output
 # (28 boxes, 1621 ref chars) at every point:
 #
 #     torch 2.6.0+cu124    CUDA 12.4   transformers 4.51.3
 #     torch 2.11.0+cu130   CUDA 13.0   transformers 5.12.1
-#     torch 2.13.0+cu132   CUDA 13.2   transformers 5.15.1     <- current frontier
+#     torch 2.13.0+cu132   CUDA 13.2   transformers 5.15.1     <- newest that exists
 #
-# 2.13.0 is the newest torch published, 5.15.1 the newest transformers, cu132
-# the newest CUDA index that exists. Nothing beyond patches/05 was needed.
+# torch 2.0 is where scaled_dot_product_attention arrives, and it is also
+# transformers' own declared floor; the checkpoint asserts no torch version at
+# all. transformers 4.51 is where models.qwen3 appears, which the checkpoint
+# imports at module level for a branch it never takes (its architectures are
+# Qwen2ForCausalLM). Make that import lazy and the next wall is 4.45, at
+# processing_utils.Unpack.
 #
-# The floor is NOT ours and NOT torch's. transformers 4.51 is required because
-# configuration_locateanything.py and modeling_locateanything.py import Qwen3 at
-# module level, for a branch this checkpoint never takes (its architectures are
-# Qwen2ForCausalLM), and transformers.models.qwen3 first appears in 4.51.0.
-# Make that import lazy and the next wall is 4.45, where processing_utils grew
-# Unpack. torch only ever needed 2.x, for scaled_dot_product_attention.
-#
-# So: if the box already has a working torch, this script uses it. It does not
-# want a new one.
+# CONSEQUENCE, and the point of all of it: this script installs as little as it
+# can. If the box has a working torch it uses it and downloads no wheels; if
+# transformers is at or above the floor it is left alone at whatever version it
+# is. The only version it will ever change is a transformers below 4.51, and it
+# upgrades to the minimum, not the latest.
 #
 # LA_UNPINNED=1 takes current HEAD instead of the pinned checkpoint revision,
 # which is how you find out whether a newer checkpoint works -- deliberately,
@@ -54,6 +57,16 @@ BASE="${LA_BASE:-$(dirname "$REPO")}"
 MODEL_REPO="nvidia/LocateAnything-3B"
 MODEL_REV="c32291ca5e996f5a7a485845b4f57a233936bba0"
 if [ -n "${LA_UNPINNED:-}" ]; then MODEL_REV=""; fi
+
+# Minimums, not preferences. Neither of these is ours and neither is a ceiling.
+TORCH_MIN="2.0"        # scaled_dot_product_attention, and transformers' own floor
+TF_MIN="4.51"          # transformers.models.qwen3, which the checkpoint imports at
+                       # module level for a branch it never takes
+# A >= B, tolerating "2.11.0+cu130"
+ver_ge() {
+  local a="${1%%+*}" b="${2%%+*}"
+  [ "$(printf '%s\n%s\n' "$b" "$a" | sort -V | head -1)" = "$b" ]
+}
 
 CHECK=0; SGLANG=0; FIXDECODE=0; REMOTE_HOST=""
 for a in "$@"; do
@@ -295,7 +308,13 @@ if ! "$PY" -c "import torch" >/dev/null 2>&1; then
 fi
 TORCH_V="$("$PY" -c 'import torch;print(torch.__version__)' 2>/dev/null)" \
   || die "torch will not import from $PY"
-ok "torch $TORCH_V"
+ver_ge "$TORCH_V" "$TORCH_MIN" \
+  || die "torch $TORCH_V is below the $TORCH_MIN minimum. The model needs
+       scaled_dot_product_attention, which arrived in torch 2.0. Nothing in this
+       repo can work around that -- it is the one torch API the checkpoint
+       cannot do without.
+       There is NO upper bound: 2.13.0 is tested and so is 2.6.0."
+ok "torch $TORCH_V (min $TORCH_MIN, no maximum)"
 "$PY" -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" \
   || die "torch cannot see the GPU from $PY"
 ok "CUDA visible to torch"
@@ -323,7 +342,20 @@ if [ -z "$CUR_TF" ]; then
   "$PY" -m pip install -q transformers || die "could not install transformers"
   CUR_TF="$("$PY" -c 'import transformers;print(transformers.__version__)')"
 fi
-ok "transformers $CUR_TF (unpinned; patches/05 covers 4.x and 5.x)"
+# Below the floor is the ONLY case where this script touches a transformers that
+# is already installed, and it says so rather than doing it quietly.
+ver_ge "$CUR_TF" "$TF_MIN" || {
+  [ "$CHECK" -eq 1 ] && die "transformers $CUR_TF is below the $TF_MIN minimum"
+  warn "transformers $CUR_TF is below the $TF_MIN minimum."
+  warn "Not our floor: configuration_locateanything.py and modeling_locateanything.py"
+  warn "import transformers.models.qwen3 at module level, for a branch this"
+  warn "checkpoint never takes, and that module first ships in 4.51.0."
+  warn "Upgrading to the minimum only -- nothing newer is required."
+  "$PY" -m pip install -q "transformers>=$TF_MIN" \
+    || die "could not upgrade transformers to >=$TF_MIN"
+  CUR_TF="$("$PY" -c 'import transformers;print(transformers.__version__)')"
+}
+ok "transformers $CUR_TF (min $TF_MIN, no maximum — patches/05 spans 4.x and 5.x)"
 
 MISSING=()
 for m in accelerate huggingface_hub PIL numpy einops timm requests peft; do
