@@ -1,0 +1,112 @@
+From: locateanything-perf
+Subject: SGLang's own MoonViT port carries the same 3-D SDPA defect, so serving
+         a full-resolution page OOMs a 24 GB card
+
+sglang/srt/models/kimi_vl_moonvit.py. Apply to the installed sglang:
+
+    patch -p0 $(python -c "import sglang.srt.models.kimi_vl_moonvit as m; print(m.__file__)") \
+        < patches/06-sglang-moonvit-sdpa-4d.patch
+
+and launch the server with LA_VIT_FASTMASK=1.
+
+WHAT IS WRONG
+
+sglang/srt/models/kimi_vl_moonvit.py vendors the checkpoint's modeling_vit.py
+almost verbatim -- same sdpa_attention(), same VL_VISION_ATTENTION_FUNCTIONS
+dict, same defect. patches/01 fixes it in the checkpoint; nothing was fixing it
+in the copy SGLang actually executes, because locateanything_fix.apply() rebinds
+the checkpoint's dict inside your process and the SGLang server is a different
+process running a different module.
+
+So a server that loads cleanly and reports healthy dies on the first real page:
+
+    File "sglang/srt/models/kimi_vl_moonvit.py", line 172, in sdpa_attention
+      attn_output = F.scaled_dot_product_attention(q, k, v, attention_mask, ...)
+    torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 10.62 GiB.
+    GPU 0 has a total capacity of 23.56 GiB of which 2.75 GiB is free.
+
+    [SIGQUIT received. signum=None. It usually means one child failed.]
+
+and it takes the whole server down with it, not just the request. Measured on an
+RTX 3090 with --mem-fraction-static 0.80 on a 1536x2048 page scan.
+
+The cause is the same one patches/01 documents. q/k/v reach SDPA 3-dimensional,
+[heads, seq, head_dim]. Every fused kernel requires 4-D, so flash, mem-efficient
+and cuDNN are all silently disqualified and SDPA falls back to the math backend,
+which materialises the [heads, S, S] score matrix in fp32. The dense [1, S, S]
+bool mask disqualifies flash a second time, and for a single packed sequence
+that mask is entirely True -- it masks nothing.
+
+WHY IT BITES HARDER UNDER SGLANG THAN IN-PROCESS
+
+Weights and the KV pool are preallocated: --mem-fraction-static 0.80 hands 80%
+of the card to the runtime up front. The vision tower then has to find its
+scratch in what is left -- here 2.75 GiB out of 23.56 -- so the same page that
+merely runs slowly in-process cannot allocate at all under the server.
+
+THIS IS OPT-IN, THE SAME WAY patches/01 IS
+
+Gated on LA_VIT_FASTMASK=1, so applying the patch changes nothing until you ask
+for it and an A/B needs no second install. Note the server reads the environment
+of the process you launch it from:
+
+    LA_VIT_FASTMASK=1 python -m sglang.launch_server --model-path ... 
+
+With more than one image packed into a batch, q_cu_seqlens has more than two
+entries, the block-diagonal mask is still built and still correct -- only the
+4-D reshape applies, and [1, S, S] broadcasts against [1, heads, S, S] scores.
+
+--- kimi_vl_moonvit.py
++++ kimi_vl_moonvit.py
+@@ -157,19 +157,41 @@
+     assert q.dim() == k.dim() == v.dim() == 3, "q, k, v must have 3 dims"
+     assert q_cu_seqlens[-1] == q.shape[0], "q_cu_seqlens must sum to q.shape[0]"
+     seq_length = q.shape[0]
+-    attention_mask = torch.zeros(
+-        [1, seq_length, seq_length], device=q.device, dtype=torch.bool
+-    )
+-    for i in range(1, len(q_cu_seqlens)):
+-        attention_mask[
+-            ...,
+-            q_cu_seqlens[i - 1] : q_cu_seqlens[i],
+-            q_cu_seqlens[i - 1] : q_cu_seqlens[i],
+-        ] = True
++    # Same change as patches/01 makes to the HF checkpoint's modeling_vit.py --
++    # this file is a verbatim vendoring of it, bug included. Two parts:
++    #
++    # (1) q/k/v arrive here 3-dimensional [heads, seq, head_dim]. torch says:
++    #     "All fused kernels requires query, key and value to be 4 dimensional,
++    #      but got Query dim: 3" -- so flash, mem-efficient AND cuDNN are all
++    #     silently disqualified and SDPA drops to the math backend, which
++    #     materialises [heads, S, S] scores in fp32.
++    # (2) with a single packed sequence the mask below is entirely True, so it
++    #     masks nothing, and a dense mask additionally rules out the flash kernel.
++    import os as _os
++    _fast = _os.environ.get("LA_VIT_FASTMASK", "0") == "1"
++    _single = q_cu_seqlens is None or len(q_cu_seqlens) <= 2
++    if _fast and _single:
++        attention_mask = None
++    else:
++        attention_mask = torch.zeros(
++            [1, seq_length, seq_length], device=q.device, dtype=torch.bool
++        )
++        for i in range(1, len(q_cu_seqlens)):
++            attention_mask[
++                ...,
++                q_cu_seqlens[i - 1] : q_cu_seqlens[i],
++                q_cu_seqlens[i - 1] : q_cu_seqlens[i],
++            ] = True
+     q = q.transpose(0, 1)
+     k = k.transpose(0, 1)
+     v = v.transpose(0, 1)
+-    attn_output = F.scaled_dot_product_attention(q, k, v, attention_mask, dropout_p=0.0)
++    if _fast:
++        # [heads, S, D] -> [1, heads, S, D] so the fused kernels are eligible.
++        attn_output = F.scaled_dot_product_attention(
++            q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), attention_mask, dropout_p=0.0
++        ).squeeze(0)
++    else:
++        attn_output = F.scaled_dot_product_attention(q, k, v, attention_mask, dropout_p=0.0)
+     attn_output = attn_output.transpose(0, 1)
+     attn_output = attn_output.reshape(seq_length, -1)
+     return attn_output
