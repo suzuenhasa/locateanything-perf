@@ -1,5 +1,5 @@
 From: locateanything-perf
-Subject: the checkpoint's custom code assumes transformers 4.x in five places,
+Subject: the checkpoint's custom code assumes transformers 4.x in six places,
          none of which need the old version
 
 nvidia/LocateAnything-3B: modeling_locateanything.py, modeling_qwen2.py,
@@ -15,7 +15,7 @@ WHY THIS EXISTS
 
 requirements-model.txt used to pin transformers==4.57.1 with a one-line reason.
 The pin was never tested against 5.x; it recorded the first error and stopped.
-There are five, they are all small, and none of them is a real dependency on
+There are six, they are all small, and none of them is a real dependency on
 the old version -- they are places where the checkpoint restates an argument
 list or an attribute name that transformers has since moved.
 
@@ -121,6 +121,34 @@ order the traceback finds them.
    get_max_length(), renamed get_max_cache_shape() (still None for
    DynamicCache).
 
+6. THE ROTARY BUFFERS COME BACK AS UNINITIALISED MEMORY
+   modeling_qwen2.py, Qwen2RotaryEmbedding
+
+   No exception at all for this one. The model loads, reports the right
+   architecture, and every weight matches the safetensors byte for byte -- and
+   then emits pure token soup:
+
+     "_race ML AFCNY=context persecuted september null_facWie numerous exploded"
+
+   inv_freq, cos_cached and sin_cached are all registered persistent=False, so
+   they are computed in __init__ and never appear in the checkpoint. 5.x builds
+   the model on meta tensors and afterwards materialises everything the
+   checkpoint did not supply -- and materialising a meta buffer allocates
+   memory without writing to it. On a fresh load:
+
+       inv_freq[:3] == [1.19e-26, 0.0, 0.0]        (should start at 1.0)
+
+   cos is then non-finite, and layer 0's attention output is NaN on the very
+   first forward, before any cache or decode logic is involved.
+
+   transformers 5.x does re-initialise rotary buffers -- modeling_utils.py has
+   an explicit branch for it -- but only for modules carrying original_inv_freq,
+   rope_type and config, which describes transformers' own rotary class and not
+   this one, so it is skipped silently. The class gets a rebuild_buffers()
+   method that recomputes all three from self.dim and self.base, and both
+   _init_weights implementations call it. That only runs because of defect 4:
+   without post_init(), init_weights() is never reached on the composite model.
+
 WHY THE CACHE MUST BE CLEARED
 
 trust_remote_code does not execute the files in the model directory. It copies
@@ -144,7 +172,21 @@ changed runs -- from_pretrained keeps raising from a path you did not edit.
      
      def _init_weights(self, module):
          std = getattr(self.config, 'initializer_range', None) or self.config.text_config.initializer_range
-@@ -158,6 +159,19 @@
+@@ -86,6 +87,13 @@
+             module.weight.data.normal_(mean=0.0, std=std)
+             if module.padding_idx is not None:
+                 module.weight.data[module.padding_idx].zero_()
++        elif hasattr(module, 'rebuild_buffers'):
++            # The rotary embeddings' buffers are persistent=False and so absent
++            # from the checkpoint; transformers 5.x materialises them from meta
++            # without writing to them. init_weights() on the composite model
++            # dispatches through THIS _init_weights for every submodule, so the
++            # language tower's rotary modules are rebuilt from here.
++            module.rebuild_buffers()
+ 
+ 
+ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, GenerationMixin):
+@@ -158,6 +166,19 @@
          else:
              self._no_split_modules = ["Qwen2DecoderLayer"]
  
@@ -166,7 +208,42 @@ changed runs -- from_pretrained keeps raising from a path you did not edit.
          lora_config = LoraConfig(
 --- modeling_qwen2.py
 +++ modeling_qwen2.py
-@@ -239,7 +239,17 @@
+@@ -129,6 +129,34 @@
+             seq_len=max_position_embeddings, device=self.inv_freq.device, dtype=torch.get_default_dtype()
+         )
+ 
++    def rebuild_buffers(self, device=None, dtype=None):
++        """Recompute inv_freq and the cos/sin cache from self.dim and self.base.
++
++        All three are registered persistent=False, so they are absent from the
++        checkpoint. transformers 5.x builds the model on meta tensors and then
++        materialises anything the checkpoint did not supply -- and materialising
++        a meta buffer allocates memory without writing to it, so these come back
++        as whatever was on the heap. Observed on a fresh load:
++
++            inv_freq[:3] == [1.19e-26, 0.0, 0.0]
++
++        which makes cos non-finite and every attention output NaN, at layer 0,
++        on the very first forward. The model loads, reports the right shapes and
++        the right weights, and emits pure token soup.
++
++        5.x does re-initialise rotary buffers -- modeling_utils._init_weights has
++        a branch for it -- but only for modules carrying `original_inv_freq`,
++        `rope_type` and `config`, which is the shape of transformers' own rotary
++        class, not this one. So this class rebuilds itself and _init_weights
++        below calls it.
++        """
++        device = device if device is not None else self.inv_freq.device
++        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim))
++        self.register_buffer("inv_freq", inv_freq, persistent=False)
++        self._set_cos_sin_cache(
++            seq_len=self.max_position_embeddings, device=device,
++            dtype=dtype if dtype is not None else torch.get_default_dtype())
++
+     def _set_cos_sin_cache(self, seq_len, device, dtype):
+         self.max_seq_len_cached = seq_len
+         t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
+@@ -239,7 +267,17 @@
          self.num_key_value_heads = config.num_key_value_heads
          self.num_key_value_groups = self.num_heads // self.num_key_value_heads
          self.max_position_embeddings = config.max_position_embeddings
@@ -185,7 +262,7 @@ changed runs -- from_pretrained keeps raising from a path you did not edit.
          self.is_causal = True
          self.attention_dropout = config.attention_dropout
  
-@@ -1034,6 +1044,34 @@
+@@ -1034,6 +1072,34 @@
      "The bare Qwen2 Model outputting raw hidden-states without any specific head on top.",
      QWEN2_START_DOCSTRING,
  )
@@ -220,7 +297,7 @@ changed runs -- from_pretrained keeps raising from a path you did not edit.
  class Qwen2PreTrainedModel(PreTrainedModel):
      config_class = Qwen2Config
      base_model_prefix = "model"
-@@ -1050,10 +1088,11 @@
+@@ -1050,10 +1116,11 @@
              return config
          return super()._autoset_attn_implementation(config, *args, **kwargs)
  
@@ -234,7 +311,18 @@ changed runs -- from_pretrained keeps raising from a path you did not edit.
  
      def _init_weights(self, module):
          std = self.config.initializer_range
-@@ -1234,12 +1273,17 @@
+@@ -1065,6 +1132,10 @@
+             module.weight.data.normal_(mean=0.0, std=std)
+             if module.padding_idx is not None:
+                 module.weight.data[module.padding_idx].zero_()
++        elif isinstance(module, Qwen2RotaryEmbedding):
++            # See rebuild_buffers: these are persistent=False, so nothing in the
++            # checkpoint restores them and 5.x hands them back uninitialised.
++            module.rebuild_buffers()
+ 
+ 
+ QWEN2_INPUTS_DOCSTRING = r"""
+@@ -1234,12 +1305,17 @@
          past_key_values_length = 0
  
          if use_cache:
@@ -253,7 +341,7 @@ changed runs -- from_pretrained keeps raising from a path you did not edit.
              past_key_values_length = past_key_values.get_seq_length()
  
          if position_ids is None:
-@@ -1382,7 +1426,7 @@
+@@ -1382,7 +1458,7 @@
  
          next_cache = None
          if use_cache:
@@ -262,7 +350,7 @@ changed runs -- from_pretrained keeps raising from a path you did not edit.
  
          if not return_dict:
              return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
-@@ -1395,7 +1439,15 @@
+@@ -1395,7 +1471,15 @@
  
  
  class Qwen2ForCausalLM(Qwen2PreTrainedModel):
@@ -279,7 +367,7 @@ changed runs -- from_pretrained keeps raising from a path you did not edit.
  
      def __init__(self, config):
          super().__init__(config)
-@@ -1555,8 +1607,16 @@
+@@ -1555,8 +1639,16 @@
          if past_key_values is not None:
              if isinstance(past_key_values, Cache):
                  cache_length = past_key_values.get_seq_length()
