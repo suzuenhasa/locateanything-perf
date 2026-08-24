@@ -29,14 +29,24 @@ BASE="${LA_BASE:-$(dirname "$REPO")}"
 # they are all small, and patches/05 makes every one of them version-agnostic.
 #
 # Verified end to end on this checkpoint, same page, byte-identical output
-# (28 boxes, 1621 ref chars):
+# (28 boxes, 1621 ref chars) at every point:
 #
+#     torch 2.6.0+cu124    CUDA 12.4   transformers 4.51.3
 #     torch 2.11.0+cu130   CUDA 13.0   transformers 5.12.1
 #     torch 2.13.0+cu132   CUDA 13.2   transformers 5.15.1     <- current frontier
 #
-# 2.13.0 is the newest torch published, 5.15.1 the newest transformers, and
-# cu132 the newest CUDA index that exists. Nothing beyond patches/05 was needed
-# to get there.
+# 2.13.0 is the newest torch published, 5.15.1 the newest transformers, cu132
+# the newest CUDA index that exists. Nothing beyond patches/05 was needed.
+#
+# The floor is NOT ours and NOT torch's. transformers 4.51 is required because
+# configuration_locateanything.py and modeling_locateanything.py import Qwen3 at
+# module level, for a branch this checkpoint never takes (its architectures are
+# Qwen2ForCausalLM), and transformers.models.qwen3 first appears in 4.51.0.
+# Make that import lazy and the next wall is 4.45, where processing_utils grew
+# Unpack. torch only ever needed 2.x, for scaled_dot_product_attention.
+#
+# So: if the box already has a working torch, this script uses it. It does not
+# want a new one.
 #
 # LA_UNPINNED=1 takes current HEAD instead of the pinned checkpoint revision,
 # which is how you find out whether a newer checkpoint works -- deliberately,
@@ -191,19 +201,36 @@ fi
 # ---------------------------------------------------------------- interpreter
 say "Python"
 mkdir -p "$BASE"
-# Reuse an interpreter only if it ALREADY has torch and a usable transformers.
-# An interpreter with torch but the wrong transformers is usually a conda base
-# or a system python; pinning transformers there would change an environment
-# that is not ours to modify. Build a venv beside the checkout instead.
+# Reuse an interpreter that already has torch and transformers, rather than
+# downloading several GB of wheels next to a working install.
+#
+# This used to refuse anything but LA_PY or its own venv, on the grounds that
+# pinning transformers into a conda base or a system python would change an
+# environment that is not ours to modify. That reasoning died with the
+# transformers pin: nothing is installed over a version any more, and the model
+# runs on everything from 4.51 to 5.15.1. What is left is additive -- the
+# missing few of accelerate/peft/einops/timm/decord/lmdb -- so reuse is now the
+# default and the download is the fallback, which is the right way round.
+#
+# LA_NO_SYSTEM_PY=1 restores the old behaviour if you would rather keep a system
+# python untouched.
 PY=""
-# LA_PY names an interpreter explicitly. Nothing else is guessed: image-specific
-# paths like /venv/main belong to one provider's container and are wrong
-# everywhere else, so a venv beside the checkout is the only fallback.
-for c in "${LA_PY:-}" "$BASE/venv/bin/python"; do
+CANDIDATES=("${LA_PY:-}" "$BASE/venv/bin/python")
+if [ "${LA_NO_SYSTEM_PY:-0}" != "1" ]; then
+  # No image-specific paths -- /venv/main belongs to one provider's container
+  # and is wrong everywhere else. Only what is on PATH.
+  CANDIDATES+=(python3 python)
+fi
+for c in "${CANDIDATES[@]}"; do
   [ -z "$c" ] && continue
   command -v "$c" >/dev/null 2>&1 || continue
   if "$c" -c "import torch, transformers" >/dev/null 2>&1; then PY="$c"; break; fi
 done
+case "$PY" in
+  ""|"${LA_PY:-__none__}"|"$BASE/venv/bin/python") ;;
+  *) warn "reusing $PY, which already has torch — no wheels will be downloaded."
+     warn "Any MISSING model deps get pip-installed into it; LA_NO_SYSTEM_PY=1 to opt out." ;;
+esac
 if [ -z "$PY" ] && [ -x "$BASE/venv/bin/python" ]; then
   PY="$BASE/venv/bin/python"                 # half-built venv from an interrupted run
 fi

@@ -112,15 +112,55 @@ and refusing to claim success unless it prints `PATCH_VERIFIED`.
 ```bash
 bash scripts/setup.sh --check    # verify an existing install, change nothing
 bash scripts/setup.sh <sshhost>  # copy this repo to a remote box and install there
-bash scripts/setup.sh --sglang   # ALSO build the SGLang serving venv — OCR only, see below
+bash scripts/setup.sh --sglang   # ALSO patch an SGLang you already have — OCR only, see below
 ```
 
-`--sglang` is **opt-in and off by default**. It is a second ~9 GB venv and it is
-only worth it if you are reading text. Detection, grounding, pointing and GUI
-grounding do not need it and are unaffected by it.
+`--sglang` is **opt-in and off by default**, and it does not install SGLang. It
+patches one that is already importable. Installing it into a working venv would
+drag SGLang's own pinned torch over yours, which is how a good box stops being
+one — so if SGLang is missing, setup stops and says so. Use an image that ships
+it, or set `LA_SGLVENV=/path/to/venv` to have a sidecar built there. You only
+need any of this if you are reading text in volume.
 
-needs `transformers==4.57.1`. **do not install flash-attn** — transformers picks
-`flash_attention_2` for the LM, qwen2 doesn't implement it, first forward dies.
+**do not install flash-attn** — transformers picks `flash_attention_2` for the
+LM, qwen2 doesn't implement it, first forward dies.
+
+### versions — nothing here is pinned, and nothing needs upgrading
+
+Verified end to end on this checkpoint, same page, **byte-identical output at
+every point** (28 boxes, 1,621 ref chars):
+
+| torch | CUDA | transformers | |
+|---|---|---|---|
+| 2.6.0+cu124 | 12.4 | 4.51.3 | oldest tested |
+| 2.11.0+cu130 | 13.0 | 5.12.1 | |
+| 2.13.0+cu132 | 13.2 | 5.15.1 | newest that exists |
+
+The top row matters as much as the bottom one: **if your box already has a
+working torch, setup.sh uses it and downloads no wheels.** torch only ever
+needed 2.x, for `scaled_dot_product_attention`. There is no reason to upgrade a
+stack that works.
+
+The floor is transformers **4.51**, and it is not ours: the checkpoint imports
+Qwen3 at module level for a branch it never takes — its own `architectures` are
+`Qwen2ForCausalLM` — and `transformers.models.qwen3` first ships in 4.51.0. Make
+that import lazy and the next wall is 4.45, where `processing_utils` grew
+`Unpack`.
+
+The ceiling used to be 4.57.1, because the checkpoint's custom code assumes
+transformers 4.x in six places. `patches/05-transformers5-compat.patch` makes
+all six version-agnostic, so 4.x still behaves exactly as before. Five of them
+raise; the sixth does not, which is why it is applied rather than offered — the
+rotary embedding's buffers are `persistent=False`, so they are absent from the
+checkpoint, and 5.x materialises them from meta **without writing to them**:
+
+```
+inv_freq[:3] == [1.19e-26, 0.0, 0.0]     # should start at 1.0
+```
+
+`cos` is then non-finite and layer 0's attention is NaN on the first forward.
+The model loads, every weight matches the safetensors byte for byte, and it
+emits token soup. `setup.sh` applies patches/05 unconditionally.
 
 ## how to use
 
@@ -169,9 +209,13 @@ Flags in [scripts/README.md](scripts/README.md).
 
 ## measured, on this repo, on one 3090
 
-Clean install from this checkout, RTX 3090 24 GB, torch 2.11.0+cu128,
-transformers 4.57.1, bf16, no flash-attn. Corpus: 16 photographs and 9 page
-scans — book pages, a magazine spread, an invoice.
+Clean install from this checkout, RTX 3090 24 GB, bf16, no flash-attn. Corpus:
+16 photographs and 9 page scans — book pages, a magazine spread, an invoice.
+
+The locate and memory tables below were measured on torch 2.11.0+cu128 /
+transformers 4.57.1; the text tables were re-measured on torch 2.11.0+cu130 /
+transformers 5.12.1 with patches/04 applied. Box counts are unchanged across
+every stack in the version table above.
 
 ### locate — 16 photographs, one prompt, five resolutions
 
@@ -217,18 +261,26 @@ fitted against all nine OOM rows, worst error 0.05%, no free parameters.
 
 ### reading text
 
+Nine pages, `tile_ocr.py`, 10,000 patches, **with patches/04 applied** so the
+text is actually correct:
+
 | | per page | 9 pages | regions |
 |---|---:|---:|---:|
-| whole page | 7.98s | 71.8s | 423 |
-| tiled 3x3, one at a time | 14.00s | 126.0s | 858 |
-| **tiled 3x3, batched** | **5.06s** | **45.5s** | 836 |
+| whole page | 17.86s | 160.7s | 347 |
+| **tiled 3x3, batched** | **10.14s** | **91.3s** | 869 |
 
-Tiling and batching is **faster than a single whole-page pass and finds about
-twice as much**. Batching the nine tiles rather than running them in sequence is
-worth 2.77x on its own.
+Tiling and batching is **1.76x faster than a single whole-page pass and finds
+about 2.5x as many regions**, with ~23% more transcribed text.
 
-Serving the same nine pages with the model resident (`serve.py`, eager):
-5.03s/page warm, 53.15 ms/forward, startup amortising to 0.37s/request.
+Read the absolute numbers with the next section in mind. Before patches/04 the
+same corpus ran at 7.98s and 5.06s a page — but that was the model speculating
+six tokens of prose per forward and never checking them, so the boxes were right
+and the words were mush. Correct text costs roughly 2x. The 1.76x that tiling
+buys is unaffected either way.
+
+Serving the same nine pages with the model resident (`serve.py`, eager,
+measured before patches/04 so the same ~2x applies): 5.03s/page warm,
+53.15 ms/forward, startup amortising to 0.37s/request.
 `--compile` is 1.33x per forward but costs 177s of startup, so it pays back at
 about 81 pages in one process.
 
@@ -271,12 +323,57 @@ means CUDA graphs and continuous batching, which is what SGLang already is.
 |---|---|---|---|
 | locating only | n/a | correct | nothing beyond `apply()` |
 | some OCR | correct, 19.4s/page | correct | `setup.sh --fix-decode` |
-| OCR in volume | correct, 5.3s/page | correct | `setup.sh --sglang` |
+| OCR in volume | correct, 5.3s/page | correct | an SGLang install, then `setup.sh --sglang` |
 
 Detection, grounding, pointing and GUI grounding are identical across every
 decode path and need none of this.
 
-SGLang needs `patches/02-sglang-locateanything-vision-weights.patch`, which is
-not upstream. Without it the vision tower loads 54 attention tensors at random
-init, the server comes up healthy, and every box is the whole image.
-`setup.sh --sglang` applies it and verifies it took.
+### if you use SGLang, two patches — and one of them depends on the version
+
+**`patches/06-sglang-moonvit-sdpa-4d.patch` is required.**
+`sglang/srt/models/kimi_vl_moonvit.py` is a verbatim vendoring of the
+checkpoint's `modeling_vit.py`, so it carries the same 3-D SDPA defect
+patches/01 fixes — and `locateanything_fix.apply()` cannot reach it, because the
+server is a different process running a different module. Unpatched, the server
+loads clean, reports healthy, and dies on the first full-resolution page:
+
+```
+kimi_vl_moonvit.py:172  F.scaled_dot_product_attention(q, k, v, attention_mask, ...)
+torch.OutOfMemoryError: Tried to allocate 10.62 GiB
+[SIGQUIT received. It usually means one child failed.]
+```
+
+taking the whole server down, not just the request. It bites harder here than
+in-process because `--mem-fraction-static` has already claimed 80% of the card
+before the vision tower asks for scratch. Launch with `LA_VIT_FASTMASK=1` or the
+patch is inert.
+
+**`patches/02-sglang-locateanything-vision-weights.patch` depends on your SGLang
+version, and getting it wrong fails silently in both directions.** It renames the
+checkpoint's vision tensors (`wqkv`/`wo`) to the names older SGLang used
+(`attn.qkv_proj`/`attn.proj`). Newer SGLang renamed its *own* modules to match
+the checkpoint instead — upstream fixed this — so on those builds the patch
+renames the tensors **away** from the correct names. It still applies cleanly,
+which is the trap.
+
+Either way the result is the same and it does not look like a failure: all 54
+vision-attention tensors miss `params_dict` and stay at random init, the tower
+still loads its MLPs and norms, **the server comes up healthy**, and every box is
+the whole image `<0><0><1000><1000>` because the model never sees the picture.
+Measured on sglang 0.5.16: patched, 108 parameters did not receive weights;
+reverted, 0.
+
+`setup.sh --sglang` detects which way your SGLang goes rather than assuming,
+applies or reverts accordingly, and `--check` fails if patches/02 is applied to a
+build that does not want it.
+
+SGLang on the current stack (sglang 0.5.16, torch 2.11.0+cu130,
+transformers 5.12.1, one venv — the second venv is no longer needed now that the
+checkpoint runs on transformers 5.x):
+
+| concurrent | seconds | tok/s | boxes/req | degenerate |
+|---:|---:|---:|---:|---:|
+| 1 | 5.23 | 113 | 28.0 | 0 |
+| 4 | 6.62 | 358 | 28.0 | 0 |
+| 9 | 7.44 | 716 | 28.0 | 0 |
+| 18 | 9.50 | 1121 | 28.0 | 0 |
