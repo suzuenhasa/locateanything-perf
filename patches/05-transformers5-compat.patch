@@ -1,0 +1,272 @@
+From: locateanything-perf
+Subject: the checkpoint's custom code assumes transformers 4.x in five places,
+         none of which need the old version
+
+nvidia/LocateAnything-3B: modeling_locateanything.py, modeling_qwen2.py,
+batch_utils/hybrid_runtime.py. Apply inside the downloaded model directory:
+
+    patch -p0 -d $LA_MODEL < patches/05-transformers5-compat.patch
+    rm -rf "$HF_HOME/modules/transformers_modules"     # REQUIRED, see below
+
+Verified on transformers 5.12.1 / torch 2.11.0+cu130 / RTX 3090, and every
+change is guarded so 4.57.1 behaves exactly as it did before.
+
+WHY THIS EXISTS
+
+requirements-model.txt used to pin transformers==4.57.1 with a one-line reason.
+The pin was never tested against 5.x; it recorded the first error and stopped.
+There are five, they are all small, and none of them is a real dependency on
+the old version -- they are places where the checkpoint restates an argument
+list or an attribute name that transformers has since moved.
+
+Each is reached only after the previous one is fixed, so they are listed in the
+order the traceback finds them.
+
+1. ATTENTION-IMPLEMENTATION HOOK SIGNATURE
+   modeling_locateanything.py:74, modeling_qwen2.py:1053
+
+    TypeError: LocateAnythingPreTrainedModel._check_and_adjust_attn_implementation()
+               got an unexpected keyword argument 'allow_all_kernels'
+
+   The checkpoint overrides this hook so the string "magi" survives validation
+   -- the model ships its own MAGI attention kernel, which transformers does
+   not know about and would otherwise reject before the model is built. Both
+   overrides copy the base signature of the day and forward it positionally:
+
+     4.57.1   (self, attn_implementation, is_init_check=False)
+     5.12.1   (self, attn_implementation, is_init_check=False,
+                                          allow_all_kernels=False)
+
+   Neither override reads either flag. Adding allow_all_kernels by name would
+   pin it to 5.x exactly as it is now pinned to 4.x, so they forward
+   *args/**kwargs -- which is what the _autoset_attn_implementation override
+   immediately above each of them already does. The checkpoint's own author
+   solved this for the sibling hook and did not carry it across.
+
+2. rope_theta MOVED INTO A DICT
+   modeling_qwen2.py:242
+
+    AttributeError: 'Qwen2Config' object has no attribute 'rope_theta'
+
+   Note which Qwen2Config that is. configuration_locateanything.py:9 imports
+   transformers' Qwen2Config, not the configuration_qwen2.py sitting in the
+   same directory -- so the local one is dead code on this path and the text
+   tower is configured by whatever the installed transformers provides. 5.x
+   folded rope_theta into a `rope_parameters` dict and turned `rope_scaling`
+   into a property aliasing it. Read whichever exists, and say so loudly if
+   neither does rather than defaulting to 10000.0 and silently detuning RoPE.
+
+3. _tied_weights_keys BECAME A DICT
+   modeling_qwen2.py:1409
+
+    AttributeError: 'list' object has no attribute 'keys'   (in post_init)
+
+    4.57.1   ["lm_head.weight"]
+    5.12.1   {"lm_head.weight": "model.embed_tokens.weight"}
+
+   Same tie either way; only the spelling changed. Declared conditionally so
+   both versions read what they expect.
+
+4. THE COMPOSITE MODEL NEVER CALLS post_init()
+   modeling_locateanything.py, end of __init__
+
+    AttributeError: 'LocateAnythingForConditionalGeneration' object has no
+                    attribute 'all_tied_weights_keys'
+
+   raised by _finalize_model_loading, i.e. after all 770 tensors have loaded.
+   post_init() is where transformers gathers all_tied_weights_keys, the
+   parallel plans and the fp32-keep lists from a composite model's children
+   onto the parent. Every stock composite model ends __init__ with it; this one
+   never did. Under 4.x nothing read those, so it went unnoticed.
+
+   post_init() also calls init_weights(), which is a no-op here: from_pretrained
+   builds the model on meta tensors and loads the real weights afterwards.
+
+5. THE KV CACHE ROUND-TRIPS THROUGH A FORMAT THAT NO LONGER EXISTS
+   modeling_qwen2.py:1253/1396/1577-1578, batch_utils/hybrid_runtime.py:1212/1256
+
+    AttributeError: 'DynamicCache' object has no attribute 'to_legacy_cache'
+
+   Both forward passes carry the 4.x BC shim:
+
+     use_legacy_cache = not isinstance(past_key_values, Cache)
+     ...  DynamicCache.from_legacy_cache(past_key_values)     on entry
+     ...  next_decoder_cache.to_legacy_cache()                on exit
+
+   use_legacy_cache is True on the first forward for no better reason than
+   past_key_values being None, so the flag latches and EVERY step of the decode
+   loop converts the cache to a tuple and back. 5.x removed the legacy tuple
+   format along with both methods. The fix is to keep the Cache object -- which
+   is what the shim was converting away from. A caller that genuinely passes a
+   tuple still gets the 4.x conversion where it exists, and a clear error where
+   it does not.
+
+   prepare_inputs_for_generation reads two more names off the cache that 5.x
+   removed: `seen_tokens`, already a deprecated alias of get_seq_length(), and
+   get_max_length(), renamed get_max_cache_shape() (still None for
+   DynamicCache).
+
+WHY THE CACHE MUST BE CLEARED
+
+trust_remote_code does not execute the files in the model directory. It copies
+them to $HF_HOME/modules/transformers_modules/<name>/<hash>/ and imports from
+there. Patch the model directory without clearing that copy and nothing you
+changed runs -- from_pretrained keeps raising from a path you did not edit.
+
+--- modeling_locateanything.py
++++ modeling_locateanything.py
+@@ -71,10 +71,11 @@
+             return config
+         return super()._autoset_attn_implementation(config, *args, **kwargs)
+ 
+-    def _check_and_adjust_attn_implementation(self, attn_implementation, is_init_check=False):
++    def _check_and_adjust_attn_implementation(self, attn_implementation, *args, **kwargs):
+         if attn_implementation == "magi":
+             return "magi"
+-        return super()._check_and_adjust_attn_implementation(attn_implementation, is_init_check)
++        return super()._check_and_adjust_attn_implementation(
++            attn_implementation, *args, **kwargs)
+     
+     def _init_weights(self, module):
+         std = getattr(self.config, 'initializer_range', None) or self.config.text_config.initializer_range
+@@ -158,6 +159,19 @@
+         else:
+             self._no_split_modules = ["Qwen2DecoderLayer"]
+ 
++        # transformers 5.x expects every composite model to end __init__ with
++        # post_init(), which is where it collects all_tied_weights_keys, the
++        # parallel plans and the fp32-keep lists from the children onto the
++        # top-level model. This class never called it. Under 4.x nothing read
++        # those, so it went unnoticed; under 5.x from_pretrained reads
++        # all_tied_weights_keys immediately after the weights finish loading and
++        # dies with AttributeError. post_init() also calls init_weights(), which
++        # is a no-op here: from_pretrained builds the model on meta tensors and
++        # loads the real weights afterwards. Guarded on a 5.x-only method so 4.x
++        # behaviour is unchanged.
++        if hasattr(self, 'get_expanded_tied_weights_keys'):
++            self.post_init()
++
+         
+     def wrap_backbone_lora(self, r=128, lora_alpha=256, lora_dropout=0.05):
+         lora_config = LoraConfig(
+--- modeling_qwen2.py
++++ modeling_qwen2.py
+@@ -239,7 +239,17 @@
+         self.num_key_value_heads = config.num_key_value_heads
+         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+         self.max_position_embeddings = config.max_position_embeddings
+-        self.rope_theta = config.rope_theta
++        # transformers 5.x folded rope_theta into a `rope_parameters` dict and
++        # turned `rope_scaling` into a property aliasing it, so a config built by
++        # 5.x has no top-level .rope_theta -- and configuration_locateanything.py
++        # builds the text config from transformers' Qwen2Config, not the one in
++        # this directory. Read whichever the installed version provides.
++        self.rope_theta = getattr(config, 'rope_theta', None)
++        if self.rope_theta is None:
++            self.rope_theta = (getattr(config, 'rope_parameters', None) or {}).get('rope_theta')
++        if self.rope_theta is None:
++            raise ValueError('no rope_theta on the text config, as neither '
++                             'config.rope_theta nor config.rope_parameters')
+         self.is_causal = True
+         self.attention_dropout = config.attention_dropout
+ 
+@@ -1050,10 +1060,11 @@
+             return config
+         return super()._autoset_attn_implementation(config, *args, **kwargs)
+ 
+-    def _check_and_adjust_attn_implementation(self, attn_implementation, is_init_check=False):
++    def _check_and_adjust_attn_implementation(self, attn_implementation, *args, **kwargs):
+         if attn_implementation == "magi":
+             return "magi"
+-        return super()._check_and_adjust_attn_implementation(attn_implementation, is_init_check)
++        return super()._check_and_adjust_attn_implementation(
++            attn_implementation, *args, **kwargs)
+ 
+     def _init_weights(self, module):
+         std = self.config.initializer_range
+@@ -1234,12 +1245,22 @@
+         past_key_values_length = 0
+ 
+         if use_cache:
++            # transformers 5.x dropped the legacy tuple cache format, and with it
++            # DynamicCache.from_legacy_cache/.to_legacy_cache. use_legacy_cache is True
++            # on the very first forward for no better reason than past_key_values being
++            # None, so on 5.x every step of the decode loop would round-trip the cache
++            # through a format that no longer exists. Keep the Cache object instead.
+             use_legacy_cache = not isinstance(past_key_values, Cache)
+             if use_legacy_cache:
+                 if past_key_values is None:
+                     past_key_values = DynamicCache()
+-                else:
++                elif hasattr(DynamicCache, "from_legacy_cache"):
+                     past_key_values = DynamicCache.from_legacy_cache(past_key_values)
++                else:
++                    raise ValueError(
++                        "past_key_values was passed as a legacy tuple, which this "
++                        "version of transformers can no longer convert")
++                use_legacy_cache = hasattr(DynamicCache, "to_legacy_cache")
+             past_key_values_length = past_key_values.get_seq_length()
+ 
+         if position_ids is None:
+@@ -1395,7 +1416,15 @@
+ 
+ 
+ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
+-    _tied_weights_keys = ["lm_head.weight"]
++    # transformers 5.x changed _tied_weights_keys from a list of the parameter
++    # names that get tied into a dict mapping each tied name to its source, and
++    # post_init() calls .keys() on it -- a list raises AttributeError there.
++    # Both spellings describe the same tie (lm_head.weight <- the input
++    # embedding), so declare whichever the installed version reads.
++    if hasattr(PreTrainedModel, "get_expanded_tied_weights_keys"):
++        _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
++    else:
++        _tied_weights_keys = ["lm_head.weight"]
+ 
+     def __init__(self, config):
+         super().__init__(config)
+@@ -1555,8 +1584,16 @@
+         if past_key_values is not None:
+             if isinstance(past_key_values, Cache):
+                 cache_length = past_key_values.get_seq_length()
+-                past_length = past_key_values.seen_tokens
+-                max_cache_length = past_key_values.get_max_length()
++                # 5.x removed both of these off Cache: `seen_tokens` was already
++                # a deprecated alias of get_seq_length(), and get_max_length()
++                # was renamed get_max_cache_shape() (still None for DynamicCache).
++                past_length = getattr(past_key_values, "seen_tokens", None)
++                if past_length is None:
++                    past_length = cache_length
++                if hasattr(past_key_values, "get_max_length"):
++                    max_cache_length = past_key_values.get_max_length()
++                else:
++                    max_cache_length = past_key_values.get_max_cache_shape()
+             else:
+                 cache_length = past_length = past_key_values[0][0].shape[2]
+                 max_cache_length = None
+--- batch_utils/hybrid_runtime.py
++++ batch_utils/hybrid_runtime.py
+@@ -1204,12 +1204,22 @@
+     if use_cache:
+         Cache = getattr(mod, "Cache")
+         DynamicCache = getattr(mod, "DynamicCache")
++        # transformers 5.x dropped the legacy tuple cache format, and with it
++        # DynamicCache.from_legacy_cache/.to_legacy_cache. use_legacy_cache is True
++        # on the very first forward for no better reason than past_key_values being
++        # None, so on 5.x every step of the decode loop would round-trip the cache
++        # through a format that no longer exists. Keep the Cache object instead.
+         use_legacy_cache = not isinstance(past_key_values, Cache)
+         if use_legacy_cache:
+             if past_key_values is None:
+                 past_key_values = DynamicCache()
+-            else:
++            elif hasattr(DynamicCache, "from_legacy_cache"):
+                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
++            else:
++                raise ValueError(
++                    "past_key_values was passed as a legacy tuple, which this "
++                    "version of transformers can no longer convert")
++            use_legacy_cache = hasattr(DynamicCache, "to_legacy_cache")
+         past_key_values_length = past_key_values.get_seq_length()
+ 
+     if position_ids is None:
