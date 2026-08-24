@@ -515,6 +515,11 @@ elif [ "$DECODE_PATCHED" -eq 0 ] && [ "$CHECK" -eq 1 ]; then
 fi
 
 # ------------------------------------------------------------------- SGLang
+# Probed whether or not --sglang was passed, so the OCR-path report below can
+# tell "no SGLang" from "SGLang present but unpatched" -- two different problems
+# with two different answers.
+SGLPY_ANY="${LA_SGLVENV:+$LA_SGLVENV/bin/python}"
+[ -x "${SGLPY_ANY:-}" ] || SGLPY_ANY="$PY"
 if [ "$SGLANG" -eq 1 ]; then
   say "SGLang serving (optional)"
   # ONE venv is enough. This used to build a second one, on the reasoning that
@@ -656,6 +661,45 @@ EOF
   warn "launch the server with LA_VIT_FASTMASK=1, or patches/06 stays inert:"
   warn "  LA_VIT_FASTMASK=1 $SGLPY -m sglang.launch_server --model-path $MODEL_DIR \\"
   warn "      --trust-remote-code --port 30000 --mem-fraction-static 0.80"
+fi
+
+# ---------------------------------------------------------------- OCR path
+# Always reported, --sglang or not. Which OCR path you are on is a real
+# performance decision and it is invisible otherwise: nothing errors without
+# SGLang, pages just take an order of magnitude longer, and you would have no
+# reason to suspect it.
+#
+# Measured here, 9 distinct page scans, whole-page OCR, one RTX 3090:
+#
+#     in-process, patches/04 applied      160.7 s     17.9 s/page
+#     SGLang, one page at a time           51.5 s      5.7 s/page
+#     SGLang, all 9 concurrent             16.2 s      1.8 s/page
+#
+# The first gap is per-request: the model's decode loop runs at 21% of this
+# card's memory-bandwidth roofline where SGLang runs at 73%. The second is that
+# the in-process engine serves pages one after another, while SGLang overlaps
+# them -- batching tiles WITHIN a page it already does, batching ACROSS pages it
+# cannot. That is the part you lose without it.
+say "OCR path"
+if "$SGLPY_ANY" -c "import sglang" >/dev/null 2>&1; then
+  if [ "$SGLANG" -eq 1 ]; then
+    ok "SGLang patched — OCR in volume ~1.8 s/page at 9 concurrent"
+  else
+    warn "SGLang IS installed here, but this run did not patch it."
+    warn "Re-run with --sglang to apply patches/02 (version-gated) and patches/06."
+    warn "Unpatched it will either serve whole-image boxes or OOM on the first page."
+  fi
+else
+  ok "no SGLang — in-process OCR, which is the correct-but-slower path"
+  warn "OCR will run at ~17.9 s/page, and pages are served ONE AT A TIME."
+  warn "SGLang does the same 9 pages in 16.2 s total (~1.8 s/page) because it"
+  warn "overlaps requests; batching across pages is the part you do not have."
+  warn "Boxes are identical either way, and detection/grounding/pointing/GUI are"
+  warn "unaffected — this only matters if you are reading text in volume."
+  warn ""
+  warn "If you want it: install SGLang (its own venv, it pins its own torch),"
+  warn "then re-run  ./setup.sh --sglang  to apply the patches to it."
+  warn "  LA_SGLVENV=$BASE/sglvenv ./setup.sh --sglang"
 fi
 
 # ------------------------------------------------------------------- verify

@@ -323,9 +323,7 @@ producing output byte-identical to `fast`. `slow` is correct and 3.7x slower.
 SGLang has no parallel box decoder at all — decode is one token per forward — so
 it cannot stutter, and it gets its speed from batching across requests instead.
 It transcribed the page identically to `slow` (28 regions, 1,618 chars against
-1,619) in 5.32s, and nine concurrent requests — the shape of a 3x3 tiled page —
-cost 7.43s against 5.32s for one, at 1,137 tok/s and zero degenerate outputs by
-18 concurrent.
+1,619) in 5.32s. How far that scales across concurrent pages is measured below.
 
 `patches/04-hybrid-ar-fallback-on-text.patch` fixes the fallback in the model
 itself, and `setup.sh --fix-decode` applies it. That buys correct text without
@@ -384,13 +382,34 @@ reverted, 0.
 applies or reverts accordingly, and `--check` fails if patches/02 is applied to a
 build that does not want it.
 
-SGLang on the current stack (sglang 0.5.16, torch 2.11.0+cu130,
-transformers 5.12.1, one venv — the second venv is no longer needed now that the
-checkpoint runs on transformers 5.x):
+### how much slower is OCR without SGLang
 
-| concurrent | seconds | tok/s | boxes/req | degenerate |
-|---:|---:|---:|---:|---:|
-| 1 | 5.23 | 113 | 28.0 | 0 |
-| 4 | 6.62 | 358 | 28.0 | 0 |
-| 9 | 7.44 | 716 | 28.0 | 0 |
-| 18 | 9.50 | 1121 | 28.0 | 0 |
+Nine **distinct** page scans, whole-page OCR, one RTX 3090:
+
+| | 9 pages | per page |
+|---|---:|---:|
+| in-process, patches/04 applied | 160.7s | 17.9s |
+| SGLang, one page at a time | 51.5s | 5.7s |
+| **SGLang, all 9 concurrent** | **16.2s** | **1.8s** |
+
+Two separate gaps, and they compound:
+
+- **per request, 3.1x.** The model's decode loop runs at 21% of this card's
+  memory-bandwidth roofline (31.5 ms/token); SGLang runs at 73% (9.0 ms/token).
+- **across requests, another 3.2x.** The in-process engine serves pages one
+  after another. It batches tiles *within* a page — that is what the 1.76x above
+  is — but it cannot overlap *pages*. SGLang does. That is the part you do not
+  have without it.
+
+Boxes are identical either way, and detection, grounding, pointing and GUI
+grounding are unaffected. This only matters if you are reading text in volume.
+`setup.sh` says which path you are on whether or not you pass `--sglang`.
+
+Measured on sglang 0.5.16, torch 2.11.0+cu130, transformers 5.12.1, one venv —
+the second venv is no longer needed now that the checkpoint runs on
+transformers 5.x.
+
+> An earlier version of this table reported 1,137 tok/s at 18 concurrent. That
+> benchmark sent the *same* image 18 times, so SGLang's radix cache could serve
+> the shared prefill and the number was inflated. Everything above uses nine
+> different pages.
