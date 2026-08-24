@@ -116,20 +116,6 @@ are missing.
 | `LA_UNPINNED` | take the checkpoint's current HEAD instead of the pinned revision |
 | `LA_SKIP_VERIFY` | skip the final `verify_patch.py` |
 
-## Typical use
-
-```bash
-source <BASE>/env.sh
-
-python scripts/verify_patch.py --model "$LA_MODEL"
-
-# a directory of pages, model stays resident
-python scripts/serve.py --bench ./inbox --task OCR
-
-# one dense page, tiled
-python scripts/tile_ocr.py --image ./page.jpg --grid 3x3
-```
-
 ## Serving pages warm (`serve.py`)
 
 ```bash

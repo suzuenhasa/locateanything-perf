@@ -108,9 +108,35 @@ uninitialised rotary buffers and emits token soup with no error at all.
 **Do not install flash-attn** — transformers picks `flash_attention_2` for the
 LM, qwen2 doesn't implement it, first forward dies.
 
-Flags, environment variables and traps: **[scripts/README.md](scripts/README.md)**.
+Setup flags and environment variables: [scripts/README.md](scripts/README.md).
+
+## typical use
+
+`setup.sh` writes `env.sh`, which sets `PYTHONPATH`, `LA_MODEL` and `HF_HOME`:
+
+```bash
+source <BASE>/env.sh
+
+python scripts/verify_patch.py --model "$LA_MODEL"    # confirm the fix is live
+
+# a directory of pages, model stays resident
+python scripts/serve.py --bench ./pages --task OCR
+
+# one dense page, tiled 3x3 and run as one batch
+python scripts/tile_ocr.py --image ./page.jpg --grid 3x3
+
+# locate things in photographs
+python scripts/tile_ocr.py --image ./photos --modes whole \
+       --task Detection --category "cats"
+```
+
+`serve.py` keeps the model resident across requests; `tile_ocr.py` splits a page
+into a grid, runs the tiles as one batch and dedupes the boxes. Flags for both
+in [scripts/README.md](scripts/README.md).
 
 ## how to use
+
+Or in your own code:
 
 ```python
 import torch, locateanything_fix
@@ -142,19 +168,6 @@ locateanything_fix.enable_video_decode()                  # video
 
 keep the model resident — load is 4.04s and the first inference is 2x steady
 (1.19s vs 0.59s).
-
-## running it
-
-```bash
-python scripts/verify_patch.py --model /path/to/LocateAnything-3B   # confirm the fix is live
-python scripts/serve.py       --model /path/to/LocateAnything-3B --bench ./images
-python scripts/tile_ocr.py    --model /path/to/LocateAnything-3B --image ./page.jpg
-```
-
-`serve.py` keeps the model resident and torch.compiled across requests; `tile_ocr.py`
-splits a page into a grid, runs the tiles as one batch, and dedupes the boxes.
-Flags in [scripts/README.md](scripts/README.md).
-
 
 ## where things are
 
