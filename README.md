@@ -308,23 +308,35 @@ Serving the same nine pages with the model resident (`serve.py`, 2x3 tiles,
 is not a slower engine, it is more forwards: the model stops speculating six
 tokens of prose per pass and emits them one at a time.
 
-`--compile` is **1.33x per forward**, exactly as before. It saves 2.22s/page
-against 380s of extra startup, so it pays back at about **171 pages** in one
-process. Below that, run `--no-compile`.
+`--compile` is **1.33x per forward**, exactly as before. What it costs depends
+on whether torch's inductor cache is warm, and that is the difference between
+compile being worth it and not:
 
-That startup figure was 177s in an earlier version of this file, and the jump is
-mostly **not** the transformers version. Holding the box and torch fixed and
-changing only transformers:
+| | startup | saves 2.22s/page, so pays back at |
+|---|---:|---:|
+| first compile on a box (cold cache) | 387.7s | ~171 pages |
+| **every later process start (warm)** | **181.5s** | **~78 pages** |
+| `--no-compile` | 7.2s | n/a |
 
-| transformers | compile startup | graphs | ms/forward |
-|---|---:|---:|---:|
-| 4.51.3 | 320.0s | 26 | 38.56 |
-| 5.12.1 | 387.7s | 42 | 40.34 |
+**You pay 181.5s on every process start, not once.** `torch.compile` traces in
+memory; what survives is the on-disk inductor cache (94 MB at
+`/tmp/torchinductor_$USER`), which halves the trace but does not remove it.
 
-5.x traces 16 more graphs and costs 21% more startup — real, but not the
-difference between 177s and 388s. The 177s was measured on a different physical
-3090 and is not comparable; treat compile startup as something to measure on the
-box you are actually using, not a constant.
+Two consequences worth knowing:
+
+- `/tmp` does not survive a new container. If you rent boxes, point the cache
+  somewhere that persists — `TORCHINDUCTOR_CACHE_DIR=/workspace/inductor` — or
+  every fresh instance pays the 388s cold price again.
+- If your process handles fewer than ~78 pages before exiting, `--no-compile`
+  wins outright. Compile is for a long-lived `serve.py`, not for a run that
+  starts and stops.
+
+An earlier version of this file quoted 177s. That was a *warm-cache* number
+compared against a cold one — not a hardware or version difference, which is
+what it was originally attributed to. Holding box and torch fixed and changing
+only transformers, cold in both cases, 5.x does trace more: 320.0s / 26 graphs
+on 4.51.3 against 387.7s / 42 graphs on 5.12.1. Real, but not the thing that
+matters here.
 
 ### OCR text quality needs SGLang
 
