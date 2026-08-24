@@ -96,10 +96,25 @@ order the traceback finds them.
    use_legacy_cache is True on the first forward for no better reason than
    past_key_values being None, so the flag latches and EVERY step of the decode
    loop converts the cache to a tuple and back. 5.x removed the legacy tuple
-   format along with both methods. The fix is to keep the Cache object -- which
-   is what the shim was converting away from. A caller that genuinely passes a
-   tuple still gets the 4.x conversion where it exists, and a clear error where
-   it does not.
+   format along with both methods.
+
+   In modeling_qwen2.py the fix is simply to keep the Cache object, which is
+   what the shim was converting away from.
+
+   batch_utils/hybrid_runtime.py cannot do that, because its caller genuinely
+   needs the tuple view: engine_hybrid.py packs rows into a batch, right-aligns
+   and pads each row's KV, and slices the result apart again per row, all in
+   the (k, v)-per-layer representation. Left as a Cache object it fails one
+   frame later, and less legibly:
+
+       File "batch_utils/engine_hybrid.py", line 89, in _unpack_stock_after_forward
+         for k, v in out_kv:
+       ValueError: too many values to unpack (expected 2)
+
+   So hybrid_runtime.py converts in both directions at that one boundary --
+   5.x keeps the tensors on cache.layers[i].keys/.values, and update() on a
+   fresh DynamicCache initialises each layer -- and the batch engine is left
+   alone.
 
    prepare_inputs_for_generation reads two more names off the cache that 5.x
    removed: `seen_tokens`, already a deprecated alias of get_seq_length(), and
@@ -246,27 +261,54 @@ changed runs -- from_pretrained keeps raising from a path you did not edit.
                  max_cache_length = None
 --- batch_utils/hybrid_runtime.py
 +++ batch_utils/hybrid_runtime.py
-@@ -1204,12 +1204,22 @@
-     if use_cache:
-         Cache = getattr(mod, "Cache")
-         DynamicCache = getattr(mod, "DynamicCache")
-+        # transformers 5.x dropped the legacy tuple cache format, and with it
-+        # DynamicCache.from_legacy_cache/.to_legacy_cache. use_legacy_cache is True
-+        # on the very first forward for no better reason than past_key_values being
-+        # None, so on 5.x every step of the decode loop would round-trip the cache
-+        # through a format that no longer exists. Keep the Cache object instead.
-         use_legacy_cache = not isinstance(past_key_values, Cache)
-         if use_legacy_cache:
+@@ -1169,6 +1169,32 @@
+     return plan
+ 
+ 
++def _cache_to_pairs(cache):
++    """Cache -> ((k, v), ...) per layer, i.e. the old legacy-tuple view.
++
++    transformers 5.x removed Cache.to_legacy_cache()/from_legacy_cache() along
++    with the tuple cache format. engine_hybrid.py is written entirely against
++    that view -- it packs rows into a batch, right-aligns and pads each row's
++    KV, then slices the result back apart per row -- so the conversion happens
++    here, at the one boundary, rather than by rewriting the batch engine.
++
++    5.x keeps the tensors on cache.layers[i].keys/.values.
++    """
++    if hasattr(cache, "to_legacy_cache"):
++        return cache.to_legacy_cache()
++    return tuple((layer.keys, layer.values) for layer in cache.layers)
++
++
++def _cache_from_pairs(dynamic_cache_cls, pairs):
++    """The inverse. update() on a fresh DynamicCache initialises each layer."""
++    if hasattr(dynamic_cache_cls, "from_legacy_cache"):
++        return dynamic_cache_cls.from_legacy_cache(pairs)
++    cache = dynamic_cache_cls()
++    for layer_idx, (k, v) in enumerate(pairs):
++        cache.update(k, v, layer_idx)
++    return cache
++
++
+ def _direct_base_forward(
+     base,
+     input_ids=None,
+@@ -1209,7 +1235,7 @@
              if past_key_values is None:
                  past_key_values = DynamicCache()
--            else:
-+            elif hasattr(DynamicCache, "from_legacy_cache"):
-                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-+            else:
-+                raise ValueError(
-+                    "past_key_values was passed as a legacy tuple, which this "
-+                    "version of transformers can no longer convert")
-+            use_legacy_cache = hasattr(DynamicCache, "to_legacy_cache")
+             else:
+-                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
++                past_key_values = _cache_from_pairs(DynamicCache, past_key_values)
          past_key_values_length = past_key_values.get_seq_length()
  
      if position_ids is None:
+@@ -1253,7 +1279,7 @@
+         all_hidden_states += (hidden_states,)
+     next_cache = None
+     if use_cache:
+-        next_cache = next_decoder_cache.to_legacy_cache() if use_legacy_cache else next_decoder_cache
++        next_cache = _cache_to_pairs(next_decoder_cache) if use_legacy_cache else next_decoder_cache
+     return SimpleNamespace(
+         last_hidden_state=hidden_states,
+         past_key_values=next_cache,
