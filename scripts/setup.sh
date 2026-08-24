@@ -24,10 +24,19 @@ BASE="${LA_BASE:-$(dirname "$REPO")}"
 #
 #   python 3.12.3   torch 2.11.0+cu128   torchvision 0.26.0+cu128   model c32291ca
 #
-# transformers is deliberately NOT pinned. It used to be, to 4.57.1, on the
-# strength of the first error 5.x produced. There are six, they are all small,
-# and patches/05 makes every one of them version-agnostic -- verified on 4.57.1
-# and on 5.12.1. See that patch for what each one is.
+# torch and transformers are deliberately NOT pinned. transformers used to be,
+# to 4.57.1, on the strength of the first error 5.x produced. There are six,
+# they are all small, and patches/05 makes every one of them version-agnostic.
+#
+# Verified end to end on this checkpoint, same page, byte-identical output
+# (28 boxes, 1621 ref chars):
+#
+#     torch 2.11.0+cu130   CUDA 13.0   transformers 5.12.1
+#     torch 2.13.0+cu132   CUDA 13.2   transformers 5.15.1     <- current frontier
+#
+# 2.13.0 is the newest torch published, 5.15.1 the newest transformers, and
+# cu132 the newest CUDA index that exists. Nothing beyond patches/05 was needed
+# to get there.
 #
 # LA_UNPINNED=1 takes current HEAD instead of the pinned checkpoint revision,
 # which is how you find out whether a newer checkpoint works -- deliberately,
@@ -213,17 +222,34 @@ ok "$PY ($("$PY" -V 2>&1))"
 # CUDA wheel selection from the driver, not hardcoded. torch's default PyPI
 # build targets one CUDA version; a driver older than that cannot load it, and
 # the failure arrives several GB into the download as "The NVIDIA driver on your
-# system is too old". CUDA 12.x wheels run on any 12.x driver.
+# system is too old". Wheels run on any driver of the same CUDA major.
+#
+# This used to send every 13.x driver to cu128, which was written when cu13x
+# wheels did not exist yet and left modern boxes two CUDA releases behind their
+# own driver. Not every minor gets an index -- cu131 and cu133 are 404 -- so the
+# list below is the ones that exist, newest first, and anything unrecognised
+# falls back rather than guessing at a URL.
 DRV_CUDA="$(nvidia-smi 2>/dev/null | grep -oE 'CUDA Version: *[0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+' | head -1)"
 TORCH_INDEX="${TORCH_INDEX:-}"
 if [ -z "$TORCH_INDEX" ]; then
   case "$DRV_CUDA" in
-    13.*|1[4-9].*)     TORCH_INDEX="https://download.pytorch.org/whl/cu128" ;;
-    12.[89]|12.1[0-9]) TORCH_INDEX="https://download.pytorch.org/whl/cu128" ;;
-    12.[0-7])          TORCH_INDEX="https://download.pytorch.org/whl/cu126" ;;
+    13.[2-9]|13.1[0-9]|1[4-9].*) TORCH_INDEX="https://download.pytorch.org/whl/cu132" ;;
+    13.[01])                     TORCH_INDEX="https://download.pytorch.org/whl/cu130" ;;
+    12.9|12.1[0-9])              TORCH_INDEX="https://download.pytorch.org/whl/cu129" ;;
+    12.8)                        TORCH_INDEX="https://download.pytorch.org/whl/cu128" ;;
+    12.[0-7])                    TORCH_INDEX="https://download.pytorch.org/whl/cu126" ;;
     *) TORCH_INDEX="https://download.pytorch.org/whl/cu128"
        warn "could not read the driver's CUDA version; assuming cu128" ;;
   esac
+  # An index that 404s costs you the whole install several GB in. Check it is
+  # actually there, and step back to cu128 -- which has existed throughout --
+  # rather than failing.
+  if command -v curl >/dev/null 2>&1; then
+    if [ "$(curl -s -o /dev/null -w '%{http_code}' -m 10 "$TORCH_INDEX/torch/" || echo 000)" != "200" ]; then
+      warn "${TORCH_INDEX##*/} is not a live wheel index; falling back to cu128"
+      TORCH_INDEX="https://download.pytorch.org/whl/cu128"
+    fi
+  fi
 fi
 [ -n "$DRV_CUDA" ] && ok "driver supports CUDA $DRV_CUDA — using ${TORCH_INDEX##*/} wheels"
 

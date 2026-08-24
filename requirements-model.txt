@@ -8,11 +8,12 @@
 # satisfied while torchvision::nms fails to register and AutoProcessor won't
 # import.
 
-transformers           # 4.57.1 and 5.12.1 both work. The checkpoint's custom
-                       # code assumes 4.x in three places -- an attention-hook
-                       # signature, _tied_weights_keys as a list, and a missing
-                       # post_init() -- all of which patches/05 makes
-                       # version-agnostic. Without patches/05, pin ==4.57.1.
+transformers           # unpinned. The checkpoint's custom code assumes 4.x in
+                       # six places, all of which patches/05 makes
+                       # version-agnostic. Verified on 4.57.1, 5.12.1 and
+                       # 5.15.1. Without patches/05, pin ==4.57.1 -- five of
+                       # the six raise on 5.x and the sixth silently returns
+                       # uninitialised rotary buffers, i.e. noise.
 accelerate
 huggingface_hub
 pillow
