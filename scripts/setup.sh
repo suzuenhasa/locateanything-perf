@@ -671,9 +671,10 @@ fi
 #
 # Measured here, 9 distinct page scans, whole-page OCR, one RTX 3090:
 #
-#     in-process, patches/04 applied      160.7 s     17.9 s/page
-#     SGLang, one page at a time           51.5 s      5.7 s/page
-#     SGLang, all 9 concurrent             16.2 s      1.8 s/page
+#     in-process, patches/04 applied      160.7 s    17.90 s/page
+#     SGLang, one page at a time           54.7 s     6.08 s/page
+#     SGLang, 6 concurrent                 12.9 s     1.44 s/page
+#     SGLang, 9 concurrent                 12.1 s     1.35 s/page
 #
 # The first gap is per-request: the model's decode loop runs at 21% of this
 # card's memory-bandwidth roofline where SGLang runs at 73%. The second is that
@@ -683,7 +684,7 @@ fi
 say "OCR path"
 if "$SGLPY_ANY" -c "import sglang" >/dev/null 2>&1; then
   if [ "$SGLANG" -eq 1 ]; then
-    ok "SGLang patched — OCR in volume ~1.8 s/page at 9 concurrent"
+    ok "SGLang patched — OCR in volume ~1.35 s/page at 9 concurrent"
   else
     warn "SGLang IS installed here, but this run did not patch it."
     warn "Re-run with --sglang to apply patches/02 (version-gated) and patches/06."
@@ -692,7 +693,7 @@ if "$SGLPY_ANY" -c "import sglang" >/dev/null 2>&1; then
 else
   ok "no SGLang — in-process OCR, which is the correct-but-slower path"
   warn "OCR will run at ~17.9 s/page, and pages are served ONE AT A TIME."
-  warn "SGLang does the same 9 pages in 16.2 s total (~1.8 s/page) because it"
+  warn "SGLang does the same 9 pages in 12.1 s total (~1.35 s/page) because it"
   warn "overlaps requests; batching across pages is the part you do not have."
   warn "Boxes are identical either way, and detection/grounding/pointing/GUI are"
   warn "unaffected — this only matters if you are reading text in volume."

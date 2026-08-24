@@ -295,11 +295,23 @@ six tokens of prose per forward and never checking them, so the boxes were right
 and the words were mush. Correct text costs roughly 2x. The 1.76x that tiling
 buys is unaffected either way.
 
-Serving the same nine pages with the model resident (`serve.py`, eager,
-measured before patches/04 so the same ~2x applies): 5.03s/page warm,
-53.15 ms/forward, startup amortising to 0.37s/request.
-`--compile` is 1.33x per forward but costs 177s of startup, so it pays back at
-about 81 pages in one process.
+Serving the same nine pages with the model resident (`serve.py`, 2x3 tiles,
+`--temperature 0`, patches/04 applied):
+
+| | per page | ms/forward | startup |
+|---|---:|---:|---:|
+| eager | 8.92s | 53.75 | 7.2s |
+| `--compile` | 6.70s | 40.34 | 387.7s |
+
+**`ms/forward` is the invariant unit here, and patches/04 does not move it** —
+53.75 against 53.15 measured before the patch, a 1.1% difference. Correct text
+is not a slower engine, it is more forwards: the model stops speculating six
+tokens of prose per pass and emits them one at a time.
+
+`--compile` is **1.33x per forward**, exactly as before, but startup grew from
+177s to 388s on this stack (42 graphs). It saves 2.22s/page against 380s of
+extra startup, so it now pays back at about **171 pages** in one process rather
+than 81. Below that, run `--no-compile`.
 
 ### OCR text quality needs SGLang
 
@@ -338,7 +350,7 @@ means CUDA graphs and continuous batching, which is what SGLang already is.
 |---|---|---|---|
 | locating only | n/a | correct | nothing beyond `apply()` |
 | some OCR | correct, 19.4s/page | correct | `setup.sh --fix-decode` |
-| OCR in volume | correct, 5.3s/page | correct | an SGLang install, then `setup.sh --sglang` |
+| OCR in volume | correct, 1.35s/page at 9 concurrent | correct | an SGLang install, then `setup.sh --sglang` |
 
 Detection, grounding, pointing and GUI grounding are identical across every
 decode path and need none of this.
@@ -384,19 +396,25 @@ build that does not want it.
 
 ### how much slower is OCR without SGLang
 
-Nine **distinct** page scans, whole-page OCR, one RTX 3090:
+Nine **distinct** page scans, whole-page OCR, one RTX 3090. Same nine files
+through both paths, warm server:
 
 | | 9 pages | per page |
 |---|---:|---:|
 | in-process, patches/04 applied | 160.7s | 17.9s |
-| SGLang, one page at a time | 51.5s | 5.7s |
-| **SGLang, all 9 concurrent** | **16.2s** | **1.8s** |
+| SGLang, one page at a time | 54.7s | 6.08s |
+| SGLang, 3 concurrent | 22.5s | 2.50s |
+| SGLang, 6 concurrent | 12.9s | 1.44s |
+| **SGLang, 9 concurrent** | **12.1s** | **1.35s** |
+
+Concurrency saturates around six — past that the card is the limit, not the
+scheduler. End to end that is **13x** on the same nine pages.
 
 Two separate gaps, and they compound:
 
-- **per request, 3.1x.** The model's decode loop runs at 21% of this card's
+- **per request, 2.9x.** The model's decode loop runs at 21% of this card's
   memory-bandwidth roofline (31.5 ms/token); SGLang runs at 73% (9.0 ms/token).
-- **across requests, another 3.2x.** The in-process engine serves pages one
+- **across requests, another 4.5x.** The in-process engine serves pages one
   after another. It batches tiles *within* a page — that is what the 1.76x above
   is — but it cannot overlap *pages*. SGLang does. That is the part you do not
   have without it.
