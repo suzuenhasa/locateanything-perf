@@ -258,9 +258,23 @@ It transcribed the page identically to `slow` (28 regions, 1,618 chars against
 cost 7.43s against 5.32s for one, at 1,137 tok/s and zero degenerate outputs by
 18 concurrent.
 
-**So: use SGLang if you are reading text, and skip it otherwise.** Boxes,
-points, grounding and GUI grounding are identical across all decode paths and
-need nothing beyond `apply()`.
+`patches/04-hybrid-ar-fallback-on-text.patch` fixes the fallback in the model
+itself, and `setup.sh --fix-decode` applies it. That buys correct text without
+SGLang, at 19.4s a page against SGLang's 5.3s — the gap is not algorithmic, it
+is that the model's decode loop runs at 21% of this card's memory-bandwidth
+roofline (31.5 ms/token) where SGLang runs at 73% (9.0 ms/token). Closing that
+means CUDA graphs and continuous batching, which is what SGLang already is.
+
+**So, three ways to be correct, pick by what you are doing:**
+
+| | text | boxes | needs |
+|---|---|---|---|
+| locating only | n/a | correct | nothing beyond `apply()` |
+| some OCR | correct, 19.4s/page | correct | `setup.sh --fix-decode` |
+| OCR in volume | correct, 5.3s/page | correct | `setup.sh --sglang` |
+
+Detection, grounding, pointing and GUI grounding are identical across every
+decode path and need none of this.
 
 SGLang needs `patches/02-sglang-locateanything-vision-weights.patch`, which is
 not upstream. Without it the vision tower loads 54 attention tensors at random

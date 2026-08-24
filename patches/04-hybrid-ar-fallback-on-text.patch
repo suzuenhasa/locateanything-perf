@@ -1,0 +1,159 @@
+From: locateanything-perf
+Subject: hybrid generation_mode never falls back to AR on text, so every
+         transcription is garbled
+
+nvidia/LocateAnything-3B, generate_utils.py + modeling_locateanything.py.
+Apply inside the downloaded model directory:
+
+    patch -p0 -d $LA_MODEL < patches/04-hybrid-ar-fallback-on-text.patch
+    rm -rf "$HF_HOME/modules/transformers_modules"     # REQUIRED, see below
+
+WHAT IS WRONG
+
+The model card documents three decode modes:
+
+    'fast'   : MTP only, never fall back to AR
+    'slow'   : AR only, pure auto-regressive decoding
+    'hybrid' : MTP first, fall back to AR on error, switch back on box_end
+
+and recommends hybrid. hybrid never falls back. On a scanned book page it
+produces output byte-identical to fast -- 1641 characters either way, 5.14s vs
+5.10s -- and both read
+
+    "during the centuries that the taken theirionalional located flight"
+
+where the same page under 'slow' reads
+
+    "during the centuries that have taken their processional flight"
+
+It is not a trigger that fails to fire. It is a check that was never written.
+handle_pattern() returns "error_box" from exactly one of its five branches --
+the one handling <box> -- and error_box is the only value the generate loop
+tests to leave MTP. The branch that handles prose returns
+
+    {"type": "ref_object", "tokens": x0, "need_switch_to_ar": False}
+
+i.e. six speculatively-decoded tokens accepted whole, with no verification of
+any kind. That is sound for coordinates: <box><x0><y0><x1><y1></box> nearly
+determines its own continuation, so a wrong guess produces a malformed pattern
+that IS detectable and does become error_box. Prose has no such structure, so a
+wrong guess is simply emitted. The stutter is the six-token block boundary.
+
+A second defect blocks the obvious one-line fix. hybrid's AR phase only ever ran
+as a rescue from a malformed box, so it assumes it is inside one:
+
+    if   token_val == box_end_token_id:                 out_type = 'box_end_ar'
+    elif coord_start <= token_val <= coord_end:         out_type = 'coord_ar'
+    else:                                               out_type = 'im_end'
+
+Route text there and the first letter of a <ref> is read as end-of-sequence and
+the response stops dead. Both halves have to change together.
+
+WHY REGION COUNTS NEVER CAUGHT IT
+
+All four paths return 28 regions on this page, within 25 characters of each
+other. The boxes are correct in every mode -- only the transcribed text differs.
+Any benchmark that counts boxes scores the garbled run and the clean run
+identically.
+
+WHAT THIS COSTS
+
+Correct text is slower, because text now decodes one token per forward instead
+of six. Measured on the same page, RTX 3090, bf16:
+
+    hybrid before   5.14s   garbled
+    hybrid after   19.36s   clean, 28 regions, 1621 chars
+    slow           22.67s   clean, 28 regions, 1619 chars
+
+The patched hybrid beats pure AR because coordinates still go through MTP:
+ref_end_ar hands control back at </ref>, so the box that follows is decoded six
+tokens at a time as before.
+
+Detection is unaffected in output and costs 5.3%: 16 photographs at 10,000
+patches, 16.72s -> 17.60s, identical box counts on all 16. The cost there is
+routing four tokens of <ref>cats</ref> through AR.
+
+THE trust_remote_code TRAP
+
+transformers executes a COPY of the model's python under
+$HF_HOME/modules/transformers_modules, not the files in the model directory.
+Patching the model directory without clearing that cache appears to work and
+changes nothing. Clear it, or the patch never runs.
+
+--- generate_utils.py	2026-08-23 22:04:55.093390626 -0400
++++ generate_utils.py	2026-08-23 22:05:19.470877553 -0400
+@@ -496,6 +496,26 @@
+         if len(x0) >= 2 and x0[-1] == x0[-2] == ref_end_token_id:
+             x0 = x0[:-1]
+ 
++        if generation_mode == 'hybrid':
++            # This branch is prose -- the contents of a <ref>. MTP predicted six
++            # of them in one forward, and nothing above verified any of it. That
++            # is sound for the box branch, where <box><x0><y0><x1><y1></box>
++            # nearly determines its own continuation and a wrong guess shows up
++            # as a malformed pattern that becomes error_box. Text has no such
++            # structure, so a wrong guess is simply emitted, which is why
++            # hybrid transcription reads "traveled traveled to the four corners
++            # of earth earth" while pure AR reads it correctly.
++            #
++            # Keep only the first token -- the one position the forward actually
++            # conditioned on real context -- and hand the rest to AR, exactly as
++            # error_box already does for a malformed box.
++            return {
++                "type": "text_ar",
++                "tokens": x0[:1],
++                "need_switch_to_ar": True,
++                "is_terminal": False,
++            }
++
+         return {
+             "type": "ref_object",
+             "tokens": x0,
+--- modeling_locateanything.py	2026-08-23 22:04:55.096007126 -0400
++++ modeling_locateanything.py	2026-08-23 22:05:19.471184253 -0400
+@@ -445,13 +445,29 @@
+             im_end_token_id = self.token_ids['im_end_token_id']
+ 
+             if generation_mode == 'hybrid':
+-                # Hybrid AR phase: detect box boundaries to switch back to MTP
+-                if token_val == box_end_token_id:
++                # Hybrid AR phase: detect box boundaries to switch back to MTP.
++                #
++                # This used to end generation on ANY token that was not box_end
++                # or a coordinate, because the phase only ever ran as a rescue
++                # from a malformed box and so could assume it was inside one.
++                # Once text also routes here (handle_pattern -> text_ar) that
++                # assumption is wrong: the first letter of a <ref> would be read
++                # as end-of-sequence and the response would stop dead. Terminate
++                # on the real end token, and treat anything else as more text.
++                ref_end_token_id = self.token_ids['ref_end_token_id']
++                if token_val == im_end_token_id:
++                    out_type = 'im_end'
++                elif token_val == box_end_token_id:
+                     out_type = 'box_end_ar'
++                elif token_val == ref_end_token_id:
++                    # </ref> means the box comes next, and a box is exactly what
++                    # MTP is good at. Hand it back rather than spending one
++                    # forward per coordinate.
++                    out_type = 'ref_end_ar'
+                 elif coord_start_token_id <= token_val <= coord_end_token_id or token_val == none_token_id:
+                     out_type = 'coord_ar'
+                 else:
+-                    out_type = 'im_end'
++                    out_type = 'continue_ar'
+             else:
+                 # Slow mode: pure AR, only stop on im_end
+                 if token_val == im_end_token_id:
+@@ -501,10 +517,10 @@
+                 break
+ 
+             if generation_mode == 'hybrid':
+-                if out_type == 'error_box':
++                if out_type in ('error_box', 'text_ar'):
+                     use_mtp = False
+                     switch_to_ar_count += 1
+-                elif out_type == 'box_end_ar':
++                elif out_type in ('box_end_ar', 'ref_end_ar'):
+                     use_mtp = True
+             # fast mode: use_mtp stays True always
+             # slow mode: use_mtp stays False always

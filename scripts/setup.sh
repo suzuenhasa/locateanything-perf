@@ -5,6 +5,7 @@
 #   ./setup.sh              on the machine that has the GPU: install here
 #   ./setup.sh --check      verify an existing install, change nothing
 #   ./setup.sh --sglang     also build the SGLang serving venv (see below)
+#   ./setup.sh --fix-decode patch the model so hybrid transcribes text correctly
 #
 # Idempotent. Everything lands beside this checkout, so removing that directory
 # removes the install. Re-run after a container recycle on an ephemeral box.
@@ -31,11 +32,12 @@ MODEL_REV="c32291ca5e996f5a7a485845b4f57a233936bba0"
 TRANSFORMERS_VER="4.57.1"
 if [ -n "${LA_UNPINNED:-}" ]; then MODEL_REV=""; TRANSFORMERS_VER=""; fi
 
-CHECK=0; SGLANG=0; REMOTE_HOST=""
+CHECK=0; SGLANG=0; FIXDECODE=0; REMOTE_HOST=""
 for a in "$@"; do
   case "$a" in
     --check)  CHECK=1 ;;
     --sglang) SGLANG=1 ;;
+    --fix-decode) FIXDECODE=1 ;;
     -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
     -*) echo "unknown flag: $a" >&2; exit 2 ;;
     *) REMOTE_HOST="$a" ;;
@@ -57,7 +59,8 @@ if [ -n "$REMOTE_HOST" ]; then
     "$REPO/" "$REMOTE_HOST:$BASE/locateanything-perf/"
   ok "sources copied"
   ssh -t "$REMOTE_HOST" "cd '$BASE/locateanything-perf' && LA_BASE='$BASE' bash scripts/setup.sh \
-    $([ $CHECK -eq 1 ] && echo --check) $([ $SGLANG -eq 1 ] && echo --sglang)"
+    $([ $CHECK -eq 1 ] && echo --check) $([ $SGLANG -eq 1 ] && echo --sglang) \
+    $([ $FIXDECODE -eq 1 ] && echo --fix-decode)"
   exit 0
 fi
 
@@ -295,6 +298,47 @@ fi
 # older revision is a real failure mode, so say where it is.
 MODCACHE="$HF_HOME/modules/transformers_modules"
 [ -d "$MODCACHE" ] && ok "custom-code cache at $MODCACHE (delete it if you ever change the model's python)"
+
+# -------------------------------------------------------------- decode patch
+# patches/04 is opt-in because it is a real trade, not a free win.
+#
+# The model's `hybrid` decode mode -- the one its own card recommends -- never
+# falls back to AR on text, so it emits six speculatively-decoded tokens of
+# prose per forward with no verification and every transcription stutters:
+# "traveled traveled to the four corners of earth earth". Boxes are unaffected;
+# only text is. patches/04 makes the fallback work.
+#
+# Correct text costs 3.8x on a page (5.14s -> 19.36s) because text then decodes
+# one token per forward. If you are reading text in volume, --sglang is the
+# better answer: it transcribes just as correctly at 5.32s. If you only ever
+# locate things, you need neither.
+PATCH4="$REPO/patches/04-hybrid-ar-fallback-on-text.patch"
+DECODE_PATCHED=0
+grep -q "text_ar" "$MODEL_DIR/generate_utils.py" 2>/dev/null && DECODE_PATCHED=1
+if [ "$FIXDECODE" -eq 1 ]; then
+  say "Decode fix (patches/04)"
+  if [ "$DECODE_PATCHED" -eq 1 ]; then
+    ok "already applied"
+  else
+    [ "$CHECK" -eq 1 ] && die "patches/04 is not applied; in-process transcription will be garbled.
+       Run ./setup.sh --fix-decode"
+    [ -f "$PATCH4" ] || die "missing $PATCH4"
+    command -v patch >/dev/null || die "'patch' not installed (apt-get install -y patch)"
+    ( cd "$MODEL_DIR" && patch -s -p0 < "$PATCH4" ) \
+      || die "patches/04 did not apply. The checkpoint's python has moved from the
+       pinned revision ${MODEL_REV:0:8}; the change is ~30 lines, see $PATCH4."
+    grep -q "text_ar" "$MODEL_DIR/generate_utils.py" \
+      || die "patch reported success but generate_utils.py has no text_ar branch"
+    ok "applied to $MODEL_DIR"
+    # transformers executes a COPY of the model's python from here, so without
+    # this the patch is inert and appears to have worked.
+    rm -rf "$HF_HOME/modules/transformers_modules"
+    ok "cleared the trust_remote_code cache (else the patch never runs)"
+  fi
+elif [ "$DECODE_PATCHED" -eq 0 ] && [ "$CHECK" -eq 1 ]; then
+  warn "patches/04 not applied: in-process OCR text will be garbled (boxes are fine)."
+  warn "Either ./setup.sh --fix-decode, or use --sglang and read text through that."
+fi
 
 # ------------------------------------------------------------------- SGLang
 if [ "$SGLANG" -eq 1 ]; then
