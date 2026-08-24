@@ -98,14 +98,26 @@ region it finds, so latency tracks how many regions land in one forward stack,
 not how many pixels went in. Splitting a page into a grid lets six small stacks
 run as one batch instead of one long serial stack.
 
-| A4 page, 2x3 | s | boxes |
-|---|---:|---:|
-| whole | 9.85 | 45 |
-| tiled-batch | **7.04** | **84** |
+Measured over nine page scans -- book pages, a magazine spread, an invoice --
+at 10,000 patches:
 
-Faster *and* it finds 87% more regions, because each tile gets more of the
-25,600-patch budget spent on its own text. On the densest pages in the corpus
-the gap reaches 2.9x (14.20 s whole, 4.94 s tiled).
+| 3x3 | s/page | 9 pages | regions |
+|---|---:|---:|---:|
+| whole | 7.98 | 71.8 | 423 |
+| tiled, one at a time | 14.00 | 126.0 | 858 |
+| tiled, batched | **5.06** | **45.5** | 836 |
+
+Faster *and* about twice the regions, because each tile gets the full
+25,600-patch budget spent on its own text. Batching the nine tiles rather than
+running them in sequence is worth 2.77x on its own -- that is the whole speed
+win, and it is why `tiled-seq` exists only as a control.
+
+The direction is corpus-dependent and the counts say which case you are in. On
+pages the whole-page pass already reads competently, tiling costs about the same
+wall clock and roughly doubles the regions. On a page it cannot read -- a dense
+newspaper front page where the whole-page pass returns five boxes -- tiling costs
+10x the time and returns 30-60x the regions. Wall clock alone will call that a
+regression; it is the whole-page arm giving up.
 
 `--overlap 48` and `--iou 0.55` exist because boxes straddling a tile seam
 otherwise arrive twice, once truncated. Raise the overlap for pages with wide
@@ -170,6 +182,44 @@ Two things it does deliberately, both of which are easy to get wrong:
 Every memory figure matched across a 3090, an H100 PCIe and an A100 80GB,
 including the OOM boundary at 39.06 GiB. That byte-identical agreement across
 three cards is the check that the protocol measures what it claims to.
+
+## OCR text quality: the boxes are right, the text may not be
+
+`tile_ocr.py` and `serve.py` both call the batch engine, which is hardcoded to
+`generation_mode="hybrid"` -- six tokens per forward through the model's
+parallel box decoder. That is right for coordinates, where the next six tokens
+are nearly determined by `<x0><y0><x1><y1>`, and wrong for prose, where they are
+not and the speculation is not rejected. The result is a systematic stutter.
+
+Same scanned book page, same prompt, one line of it:
+
+| decode path | seconds | what it read |
+|---|---:|---|
+| `slow` (pure AR) | 19.24 | `that have taken their procession flight` |
+| `hybrid` | 5.14 | `that the taken theirionalional located flight` |
+| `fast` | 5.10 | byte-identical to `hybrid` |
+| SGLang | 5.32 | `that have taken their procession flight` |
+
+Two things worth knowing before trusting an OCR number from this repo:
+
+- **`hybrid` did not fall back.** It is documented as "MTP first, fall back to AR
+  on error, switch back on box_end". On this page it produced output
+  byte-identical to `fast` -- it never fell back once.
+- **Region counts cannot see this.** All four paths return 28 regions and within
+  25 characters of each other. A benchmark that counts boxes scores the garbled
+  run and the clean run identically, which is why this went unnoticed.
+
+SGLang has no parallel box decoder (`grep -c n_future` its `locate_anything.py`:
+zero) and gets its speed from batching across requests instead, so it cannot
+stutter. It matched `slow` exactly -- 28 regions, 1,618 chars against 1,619 --
+in 5.32s, and nine concurrent requests cost 7.43s against 5.32s for one.
+
+Detection, grounding, pointing and GUI grounding are unaffected: their output is
+coordinates, which is what the parallel decoder is for. Only transcription is
+hit. `setup.sh --sglang` builds the serving venv and applies `patches/02`,
+without which the vision tower loads 54 tensors at random init and every box is
+the whole image.
+
 
 ## Traps
 

@@ -102,9 +102,22 @@ Also run on an **A100 80GB (sm_80)** the same day:
 ```bash
 git clone https://github.com/suzuenhasa/locateanything-perf.git
 cd locateanything-perf
-bash scripts/setup.sh
-python scripts/verify_patch.py
+bash scripts/setup.sh            # checks the box, installs, downloads, verifies
 ```
+
+`setup.sh` checks the card, the driver's CUDA version, disk, and every pinned
+dependency before it installs anything, then ends by running `verify_patch.py`
+and refusing to claim success unless it prints `PATCH_VERIFIED`.
+
+```bash
+bash scripts/setup.sh --check    # verify an existing install, change nothing
+bash scripts/setup.sh <sshhost>  # copy this repo to a remote box and install there
+bash scripts/setup.sh --sglang   # ALSO build the SGLang serving venv — OCR only, see below
+```
+
+`--sglang` is **opt-in and off by default**. It is a second ~9 GB venv and it is
+only worth it if you are reading text. Detection, grounding, pointing and GUI
+grounding do not need it and are unaffected by it.
 
 needs `transformers==4.57.1`. **do not install flash-attn** — transformers picks
 `flash_attention_2` for the LM, qwen2 doesn't implement it, first forward dies.
@@ -151,5 +164,105 @@ python scripts/tile_ocr.py    --model /path/to/LocateAnything-3B --image ./page.
 ```
 
 `serve.py` keeps the model resident and torch.compiled across requests; `tile_ocr.py`
-splits a page into a grid and dedupes the boxes, which is worth 2.9x on dense pages.
+splits a page into a grid, runs the tiles as one batch, and dedupes the boxes.
 Flags in [scripts/README.md](scripts/README.md).
+
+## measured, on this repo, on one 3090
+
+Clean install from this checkout, RTX 3090 24 GB, torch 2.11.0+cu128,
+transformers 4.57.1, bf16, no flash-attn. Corpus: 16 photographs and 9 page
+scans — book pages, a magazine spread, an invoice.
+
+### locate — 16 photographs, one prompt, five resolutions
+
+| patches | pixels (typical) | mean/photo | instances found |
+|---|---|---:|---:|
+| 2,500 | 606x808 | 0.39s | 54 |
+| 5,476 | 897x1196 | 0.64s | 55 |
+| 10,000 | 1212x1616 | 1.04s | 55 |
+| 14,400 | 1455x1940 | 1.57s | 55 |
+| 25,600 | 1940x2586 | 3.55s | 55 |
+
+**Resolution does not buy recall on this task.** The same 55 instances across 16
+photographs at every rung, 9x the time. One photo gains one instance between the
+first two rungs and nothing changes after that. The reason to have the headroom
+is that the shipped code cannot run the middle of that table at all — see below.
+
+### the fix, three ways
+
+Same photo, same prompt. `sdpa-only` is `apply()` alone; `fixed` adds
+`enable_logits_slice(keep=6)`.
+
+| patches | stock | sdpa-only | fixed |
+|---|---|---|---|
+| 5,632 | 1.65s / 4,808 MB | 0.79s / 1,494 MB | 0.75s / 372 MB |
+| 10,320 | 4.21s / 15,526 MB | 1.80s / 2,635 MB | 1.45s / 596 MB |
+| 14,484 | **OOM** | 2.11s / 3,635 MB | 1.91s / 862 MB |
+| 25,840 | **OOM** | 4.79s / 6,421 MB | 3.83s / 1,394 MB |
+| 40,460 | **OOM** | 7.89s / 10,001 MB | 8.15s / 1,816 MB |
+| 66,272 | **OOM** | 18.38s / 15,773 MB | 18.54s / 3,298 MB |
+
+Across all eight prompt templates at 10,000 patches the SDPA change alone is
+**1.9-3.8x faster (mean 3.2x) and 5.4-6.0x less activation memory**; with
+`logits_slice` the memory figure becomes 18.5-28.7x. The two remove different
+costs — the attention change is quadratic in patches, `logits_slice` is linear
+in tokens times the 152,681-token vocabulary — so below ~10k patches the first
+dominates and above it the second does. Neither alone gets you high resolution.
+
+Stock's failure is exact. Every OOM matches a dense tensor over
+`S = (2*ceil(w/28)) * (2*ceil(h/28))`, the processor's real patch grid: the bool
+mask at 1 byte, torch's bf16 copy of it at 2, and the fp32 attention score
+matrix `[16,S,S]` at 64. Whichever first exceeds free VRAM is what you see —
+fitted against all nine OOM rows, worst error 0.05%, no free parameters.
+
+### reading text
+
+| | per page | 9 pages | regions |
+|---|---:|---:|---:|
+| whole page | 7.98s | 71.8s | 423 |
+| tiled 3x3, one at a time | 14.00s | 126.0s | 858 |
+| **tiled 3x3, batched** | **5.06s** | **45.5s** | 836 |
+
+Tiling and batching is **faster than a single whole-page pass and finds about
+twice as much**. Batching the nine tiles rather than running them in sequence is
+worth 2.77x on its own.
+
+Serving the same nine pages with the model resident (`serve.py`, eager):
+5.03s/page warm, 53.15 ms/forward, startup amortising to 0.37s/request.
+`--compile` is 1.33x per forward but costs 177s of startup, so it pays back at
+about 81 pages in one process.
+
+### OCR text quality needs SGLang
+
+The box counts above are right in every mode. **The transcribed text is not.**
+
+This model decodes six tokens per forward through its parallel box decoder. For
+coordinates (`<x0><y0><x1><y1>`) the next six tokens are nearly determined and
+that works. For prose they are not, the speculation is not rejected, and the
+output stutters. Measured on a scanned book page, same page, same prompt:
+
+| decode path | seconds | transcription |
+|---|---:|---|
+| `generation_mode="slow"` (pure AR) | 19.24 | `...that have taken their procession flight` |
+| `generation_mode="hybrid"` | 5.14 | `...that the taken theirionalional located flight` |
+| `generation_mode="fast"` | 5.10 | byte-identical to `hybrid` |
+| **SGLang** | **5.32** | `...that have taken their procession flight` |
+
+`hybrid` is documented to fall back to AR on error; on this page it never did,
+producing output byte-identical to `fast`. `slow` is correct and 3.7x slower.
+
+SGLang has no parallel box decoder at all — decode is one token per forward — so
+it cannot stutter, and it gets its speed from batching across requests instead.
+It transcribed the page identically to `slow` (28 regions, 1,618 chars against
+1,619) in 5.32s, and nine concurrent requests — the shape of a 3x3 tiled page —
+cost 7.43s against 5.32s for one, at 1,137 tok/s and zero degenerate outputs by
+18 concurrent.
+
+**So: use SGLang if you are reading text, and skip it otherwise.** Boxes,
+points, grounding and GUI grounding are identical across all decode paths and
+need nothing beyond `apply()`.
+
+SGLang needs `patches/02-sglang-locateanything-vision-weights.patch`, which is
+not upstream. Without it the vision tower loads 54 attention tensors at random
+init, the server comes up healthy, and every box is the whole image.
+`setup.sh --sglang` applies it and verifies it took.

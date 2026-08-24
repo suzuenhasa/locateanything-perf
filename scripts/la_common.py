@@ -61,10 +61,23 @@ def parse_mixed_results(text, category_str=""):
         else:
             content = re.sub(r"</?box>", "", token, flags=re.IGNORECASE)
             coords = [float(n) for n in NUM.findall(content)]
-            if not coords:
-                continue
             label = current_label if current_label is not None else (
                 expected[0] if expected else "object")
+            if not coords:
+                # The model says "asked for, not present" as a literal
+                # <box>None</box>, and it does this per category: ask Layout for
+                # "title, paragraph, table" on a page with no table and you get
+                # three <ref>s and two Nones. Dropping them silently made a
+                # refusal indistinguishable from a category nobody requested --
+                # one located class out of three scored the same as three out of
+                # three. Emit it instead, with no coordinates.
+                #
+                # Safe for existing callers: both serve.py and tile_ocr.py switch
+                # on len(coords) and ignore anything that is neither 4 nor 2, so
+                # these never reach a box list. Anything that wants them can
+                # filter on type == "none".
+                results.append({"type": "none", "coords": [], "label": label})
+                continue
             if len(coords) == 4:
                 results.append({"type": "box", "coords": coords, "label": label})
             elif len(coords) == 2:
