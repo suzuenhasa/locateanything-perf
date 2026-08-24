@@ -42,6 +42,9 @@ Byte-identical to real flash-attn, within 1% on time. 25,600 patches is
 
 ![same two kittens, 2.96x faster](assets/panel_speed.jpg)
 
+Both tables are Detection prompts. Other tasks gain less — 4.7x on GUI
+grounding, 3.6x on pointing, 1.4x on OCR.
+
 ### reading a page
 
 Nine page scans, whole-page OCR, one 3090, correct text in every row:
@@ -53,19 +56,15 @@ Nine page scans, whole-page OCR, one 3090, correct text in every row:
 | SGLang, one page at a time | 6.1s | 54.7s |
 | **SGLang, 9 concurrent** | **1.35s** | **12.1s** |
 
-**13x end to end**, from two gaps that compound: 2.9x per request (the model's
-decode loop runs at 21% of this card's memory-bandwidth roofline, SGLang at
-73%), and 4.5x across requests, because the in-process engine serves pages one
-after another — it batches tiles *within* a page but cannot overlap pages.
-Concurrency saturates around six.
+SGLang is faster two ways: its decode is about 3x quicker per request, and it
+overlaps requests, where the in-process engine reads pages one at a time. It
+batches tiles within a page, not across pages. Past six concurrent the card is
+the limit.
 
-SGLang is **optional and only matters for text**. Detection, grounding,
-pointing and GUI grounding are identical without it. The speedup on those is
-task-dependent — 4.7x on GUI grounding, 3.6x on pointing, 1.4x on OCR — because
-a dense page spends its time in decode steps none of these fixes touch.
+You only need it for text. Detection, grounding, pointing and GUI grounding are
+the same without it.
 
-Full tables, the other cards (H100, A100), the OOM model, `torch.compile`
-break-even and the decode-mode trap: **[MEASUREMENTS.md](MEASUREMENTS.md)**.
+The rest of the numbers are in [MEASUREMENTS.md](MEASUREMENTS.md).
 
 ## video demo
 
