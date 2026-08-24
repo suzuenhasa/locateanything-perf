@@ -18,6 +18,7 @@ every stack in the version table below.
 - [Versions](#versions) — what it runs on, and where the floors come from
 - [Batched throughput, H100](#batched-throughput-h100)
 - [Accuracy](#accuracy)
+- [Packed vision](#packed-vision)
 - [Not every task speeds up the same](#not-every-task-speeds-up-the-same)
 - [Kernel probe, reproduced on three cards](#kernel-probe-reproduced-on-three-cards)
 - [Locate — resolution vs recall](#locate--16-photographs-one-prompt-five-resolutions)
@@ -107,6 +108,47 @@ AP delta **−0.0011 / −0.0021** against a shipped-vs-shipped control of 0.000
 The control is the point: run the stock arm twice and difference it, and if that
 is not exactly zero the comparison is uncalibrated and no delta from it means
 anything.
+
+---
+
+## Packed vision
+
+`enable_packed_vision()` is off by default and the smallest of the fixes, but it
+is the one whose effect is least obvious from the code.
+
+**1. The packed multi-image branch is no longer dead.** The NOTE at
+`locateanything_fix.py:125-130` says nothing reaches it. True by default — but
+`enable_packed_vision()` is exactly the caller the last sentence anticipates.
+Measured with `archive/scripts/segcheck.py`, 8 images through `batch_utils`:
+
+```
+packed OFF   segments-per-call: {1: 216}    216 calls (27 layers x 8 images), all single-sequence
+packed ON    segments-per-call: {8: 27}     27 calls (one per layer), 8 packed segments each
+```
+
+The 216 figure reproduces the existing note's 135 (27 x 5) at a different batch
+size. So the two fixes are coupled: `enable_packed_vision()` makes the segmented
+branch live, and the segmented branch is what makes packing safe.
+
+**2. `enable_packed_vision()` throughput, first measurements.** 120 video frames
+at 576x1024 (3,108 patches), batch engine, sdpa:
+
+| config | fps | s/frame | peak MB |
+|---|---:|---:|---:|
+| b1-stock | 1.55 | 0.647 | 9,488 |
+| b1 sdpa+logits | 2.80 | 0.357 | 8,099 |
+| b4 sdpa+logits | 3.82 | 0.262 | 9,378 |
+| b8 sdpa+logits | 3.92 | 0.255 | 10,689 |
+| b8 +packed | 4.09 | 0.244 | 10,548 |
+| b16 sdpa+logits | 4.07 | 0.246 | 11,236 |
+| b16 +packed | **4.37** | **0.229** | 11,239 |
+
+Packing is worth +4.3% at batch 8 and +7.4% at batch 16 on top of the SDPA fix.
+Real, but small next to the SDPA fix's own 1.81x. Batching flattens past 4, which
+says token decoding — not vision encoding — is the remaining bottleneck.
+
+Measured with `archive/scripts/segcheck.py` and the video pipeline, neither of
+which ships — see [Scripts](scripts/README.md) for what does and why.
 
 ---
 
