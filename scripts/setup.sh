@@ -599,9 +599,13 @@ EOF
 ok "wrote $BASE/env.sh"
 
 say "Ready"
+# $PY is whatever interpreter was actually used -- the venv this script built,
+# or one that was already here (LA_PY). Printing $BASE/venv unconditionally sent
+# people to activate something that may not exist and is not what ran.
+ACTIVATE="${PY%/bin/python}/bin/activate"
 cat <<EOF
    source $BASE/env.sh
-   source $BASE/venv/bin/activate
+$([ -f "$ACTIVATE" ] && echo "   source $ACTIVATE" || echo "   (interpreter: $PY)")
 
    Locate things in photographs:
      python $REPO/scripts/tile_ocr.py --image ./photos --modes whole \\
