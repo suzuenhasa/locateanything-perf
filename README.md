@@ -110,7 +110,9 @@ LM, qwen2 doesn't implement it, first forward dies.
 
 Setup flags and environment variables: [scripts/README.md](scripts/README.md).
 
-## typical use
+## using it
+
+### from the command line
 
 `setup.sh` writes `env.sh`, which sets `PYTHONPATH`, `LA_MODEL` and `HF_HOME`:
 
@@ -134,9 +136,11 @@ python scripts/tile_ocr.py --image ./photos --modes whole \
 into a grid, runs the tiles as one batch and dedupes the boxes. Flags for both
 in [scripts/README.md](scripts/README.md).
 
-## how to use
+### in your own code
 
-Or in your own code:
+The scripts are a thin layer over four calls. `apply()` is the SDPA fix and the
+only one you always want; the rest are opt-in because each helps a different
+workload.
 
 ```python
 import torch, locateanything_fix
@@ -151,8 +155,6 @@ model = AutoModel.from_pretrained(MODEL, dtype=torch.bfloat16,
 locateanything_fix.apply()        # must be after from_pretrained
 ```
 
-opt-in, by workload:
-
 ```python
 locateanything_fix.enable_vision_cache(model, maxsize=4)  # many queries, one image
 locateanything_fix.enable_logits_slice(model)             # batch >= 4
@@ -160,14 +162,14 @@ locateanything_fix.enable_packed_vision()                 # needs apply() first
 locateanything_fix.enable_video_decode()                  # video
 ```
 
-| | 4-D | logits | cache | packed |
+| what you are doing | `apply()` | logits | cache | packed |
 |---|---|---|---|---|
 | one image, one query | **yes** | — | — | — |
 | one image, many queries | **yes** | — | **yes** | — |
 | many images, batched | **yes** | **yes** | — | **yes** |
 
-keep the model resident — load is 4.04s and the first inference is 2x steady
-(1.19s vs 0.59s).
+Keep the model resident either way — load is 4.04s and the first inference is 2x
+steady (1.19s vs 0.59s), which is what `serve.py` exists to amortise.
 
 ## where things are
 
