@@ -22,15 +22,19 @@ BASE="${LA_BASE:-$(dirname "$REPO")}"
 # measured on, and nothing records which. Captured from the working install,
 # not guessed:
 #
-#   python 3.12.3   torch 2.11.0+cu128   torchvision 0.26.0+cu128
-#   transformers 4.57.1   model c32291ca
+#   python 3.12.3   torch 2.11.0+cu128   torchvision 0.26.0+cu128   model c32291ca
 #
-# LA_UNPINNED=1 takes current HEAD and latest instead, which is how you find out
-# whether a newer stack works -- deliberately, rather than by the calendar.
+# transformers is deliberately NOT pinned. It used to be, to 4.57.1, on the
+# strength of the first error 5.x produced. There are six, they are all small,
+# and patches/05 makes every one of them version-agnostic -- verified on 4.57.1
+# and on 5.12.1. See that patch for what each one is.
+#
+# LA_UNPINNED=1 takes current HEAD instead of the pinned checkpoint revision,
+# which is how you find out whether a newer checkpoint works -- deliberately,
+# rather than by the calendar.
 MODEL_REPO="nvidia/LocateAnything-3B"
 MODEL_REV="c32291ca5e996f5a7a485845b4f57a233936bba0"
-TRANSFORMERS_VER="4.57.1"
-if [ -n "${LA_UNPINNED:-}" ]; then MODEL_REV=""; TRANSFORMERS_VER=""; fi
+if [ -n "${LA_UNPINNED:-}" ]; then MODEL_REV=""; fi
 
 CHECK=0; SGLANG=0; FIXDECODE=0; REMOTE_HOST=""
 for a in "$@"; do
@@ -53,15 +57,28 @@ die()  { printf '   \033[31mXX\033[0m  %s\n' "$*" >&2; exit 1; }
 if [ -n "$REMOTE_HOST" ]; then
   say "Installing on $REMOTE_HOST"
   command -v rsync >/dev/null || die "rsync needed locally"
-  ssh "$REMOTE_HOST" "mkdir -p '$BASE/locateanything-perf'" \
+  # Where to install ON THE REMOTE. LA_BASE if you set it, otherwise that box's
+  # home directory -- resolved over there, not here. Defaulting to the local
+  # $BASE would mirror this machine's layout onto a box that has never heard of
+  # it: run this from ~/projects and the weights land in /root/projects.
+  RBASE="${LA_BASE:-$(ssh "$REMOTE_HOST" 'echo "$HOME"' 2>/dev/null)}" \
     || die "cannot ssh to '$REMOTE_HOST' — check ~/.ssh/config"
+  [ -n "$RBASE" ] || die "cannot ssh to '$REMOTE_HOST' — check ~/.ssh/config"
+  ok "installing into $RBASE on $REMOTE_HOST"
+  ssh "$REMOTE_HOST" "mkdir -p '$RBASE/locateanything-perf'" \
+    || die "cannot create $RBASE/locateanything-perf on $REMOTE_HOST"
   rsync -az --delete --exclude='.git/' --exclude='__pycache__/' --exclude='archive/' \
-    "$REPO/" "$REMOTE_HOST:$BASE/locateanything-perf/"
+    "$REPO/" "$REMOTE_HOST:$RBASE/locateanything-perf/" \
+    || die "rsync to $REMOTE_HOST failed"
   ok "sources copied"
-  ssh -t "$REMOTE_HOST" "cd '$BASE/locateanything-perf' && LA_BASE='$BASE' bash scripts/setup.sh \
+  # -t only when there IS a terminal. Forcing it without one ("Pseudo-terminal
+  # will not be allocated because stdin is not a terminal") leaves this hanging
+  # after the sources have copied, which looks like a slow install and is not.
+  TT=(-t); [ -t 0 ] || TT=(-T)
+  ssh "${TT[@]}" "$REMOTE_HOST" "cd '$RBASE/locateanything-perf' && LA_BASE='$RBASE' bash scripts/setup.sh \
     $([ $CHECK -eq 1 ] && echo --check) $([ $SGLANG -eq 1 ] && echo --sglang) \
     $([ $FIXDECODE -eq 1 ] && echo --fix-decode)"
-  exit 0
+  exit $?
 fi
 
 # ------------------------------------------------------------------- hardware
@@ -103,7 +120,9 @@ say "Disk"
 AVAIL=$(df -Pm "$BASE" 2>/dev/null | awk 'NR==2{print $4}')
 # Only count what still has to be downloaded. Demanding 27 GiB when the venv and
 # the weights are already on disk turns a working install into a hard failure.
-SGLVENV="${LA_SGLVENV:-$BASE/sglvenv}"
+# Empty means "the interpreter we are already using". A second venv is only
+# built if LA_SGLVENV names one -- see the note in the SGLang section.
+SGLVENV="${LA_SGLVENV:-}"
 NEED=0
 [ -x "$BASE/venv/bin/python" ] || NEED=$((NEED + 7500))
 [ -s "$BASE/model/config.json" ] || NEED=$((NEED + 7500))
@@ -120,6 +139,44 @@ if [ -n "$AVAIL" ]; then
   else
     ok "$((AVAIL/1024)) GiB free at $BASE (need ~$((NEED/1024)))"
   fi
+fi
+
+# -------------------------------------------------------------------- network
+# Everything past this point downloads. A box that cannot reach PyPI will build
+# a venv, spend a minute retrying, and fail with five screens of urllib3
+# backtrace that name neither the cause nor the host -- so check first and say
+# which of the two it is, because they have different fixes.
+#
+# The case this exists for: a rented box whose outbound TCP was entirely fine,
+# including to PyPI's CDN, but whose UDP port 53 was filtered. Every hostname
+# failed to resolve while every IP was reachable, and pip's error blamed pip.
+if [ "$CHECK" -eq 0 ]; then
+  say "Network"
+  DNSBAD=""; NETBAD=""
+  for h in pypi.org files.pythonhosted.org huggingface.co download.pytorch.org; do
+    getent hosts "$h" >/dev/null 2>&1 || DNSBAD="$DNSBAD $h"
+  done
+  if [ -n "$DNSBAD" ]; then
+    # Distinguish "no DNS" from "no internet": if a bare IP answers on 443 then
+    # routing is fine and only name resolution is broken.
+    if timeout 6 bash -c 'echo > /dev/tcp/1.1.1.1/443' 2>/dev/null; then
+      die "cannot resolve:$DNSBAD
+       Outbound TCP works, so this is DNS alone -- usually UDP/53 filtered on the
+       host network. Check /etc/resolv.conf, and if TCP/53 is permitted try
+       adding 'options use-vc' to it to force DNS over TCP."
+    fi
+    die "cannot resolve:$DNSBAD
+       and cannot open TCP 443 to 1.1.1.1 either, so this box has no working
+       outbound network. Nothing here can be downloaded until that is fixed."
+  fi
+  ok "pypi.org, files.pythonhosted.org, huggingface.co, download.pytorch.org resolve"
+  for hp in pypi.org:443 huggingface.co:443; do
+    timeout 8 bash -c "echo > /dev/tcp/${hp%:*}/${hp##*:}" 2>/dev/null \
+      || NETBAD="$NETBAD $hp"
+  done
+  [ -z "$NETBAD" ] || die "resolves but cannot connect to:$NETBAD
+       Routing or a firewall, not DNS. A proxy may be required (https_proxy)."
+  ok "outbound https to pypi.org and huggingface.co"
 fi
 
 # ---------------------------------------------------------------- interpreter
@@ -204,15 +261,16 @@ ok "torchvision $("$PY" -c 'import torchvision;print(torchvision.__version__)') 
 
 # ----------------------------------------------------------------------- deps
 say "Model dependencies"
-TSPEC="transformers${TRANSFORMERS_VER:+==$TRANSFORMERS_VER}"
+# Whatever is already here, as long as there is one. Installing a version over
+# the top of a working stack is how you break a box that was fine; patches/05
+# covers 4.x and 5.x alike.
 CUR_TF="$("$PY" -c 'import transformers;print(transformers.__version__)' 2>/dev/null || true)"
-if [ -n "$TRANSFORMERS_VER" ] && [ "$CUR_TF" != "$TRANSFORMERS_VER" ]; then
-  [ "$CHECK" -eq 1 ] && die "transformers is ${CUR_TF:-absent}, needs $TRANSFORMERS_VER"
-  # 5.x changed _check_and_adjust_attn_implementation's signature and the
-  # model's custom code fails to construct against it.
-  "$PY" -m pip install -q "$TSPEC" || die "could not install $TSPEC"
+if [ -z "$CUR_TF" ]; then
+  [ "$CHECK" -eq 1 ] && die "transformers is not installed"
+  "$PY" -m pip install -q transformers || die "could not install transformers"
+  CUR_TF="$("$PY" -c 'import transformers;print(transformers.__version__)')"
 fi
-ok "transformers $("$PY" -c 'import transformers;print(transformers.__version__)')"
+ok "transformers $CUR_TF (unpinned; patches/05 covers 4.x and 5.x)"
 
 MISSING=()
 for m in accelerate huggingface_hub PIL numpy einops timm requests peft; do
@@ -299,6 +357,37 @@ fi
 MODCACHE="$HF_HOME/modules/transformers_modules"
 [ -d "$MODCACHE" ] && ok "custom-code cache at $MODCACHE (delete it if you ever change the model's python)"
 
+# ------------------------------------------------------- transformers 5.x
+# patches/05 is NOT optional and NOT a trade. Without it the checkpoint's custom
+# code cannot run on transformers 5.x at all, and every change in it is guarded
+# so 4.x behaves exactly as before. Applying it unconditionally is what lets
+# this script stop pinning transformers.
+#
+# Five of the six defects raise. The sixth does not: the rotary embedding's
+# buffers are registered persistent=False, so they are absent from the
+# checkpoint, and 5.x materialises them from meta without writing to them. The
+# model loads, every weight matches the safetensors, and it emits token soup.
+# That is why this is applied rather than offered.
+PATCH5="$REPO/patches/05-transformers5-compat.patch"
+say "transformers compatibility (patches/05)"
+if grep -q "rebuild_buffers" "$MODEL_DIR/modeling_qwen2.py" 2>/dev/null; then
+  ok "already applied"
+else
+  [ "$CHECK" -eq 1 ] && die "patches/05 is not applied. On transformers 5.x the model
+       will not construct; if it does construct, the rotary buffers are
+       uninitialised and the output is noise. Re-run ./setup.sh."
+  [ -f "$PATCH5" ] || die "missing $PATCH5"
+  command -v patch >/dev/null || die "'patch' not installed (apt-get install -y patch)"
+  ( cd "$MODEL_DIR" && patch -s -p0 < "$PATCH5" ) \
+    || die "patches/05 did not apply. The checkpoint's python has moved from the
+       pinned revision ${MODEL_REV:0:8}; see $PATCH5 for what each hunk does."
+  grep -q "rebuild_buffers" "$MODEL_DIR/modeling_qwen2.py" \
+    || die "patch reported success but modeling_qwen2.py has no rebuild_buffers"
+  ok "applied to $MODEL_DIR"
+  rm -rf "$HF_HOME/modules/transformers_modules"
+  ok "cleared the trust_remote_code cache (else the patch never runs)"
+fi
+
 # -------------------------------------------------------------- decode patch
 # patches/04 is opt-in because it is a real trade, not a free win.
 #
@@ -342,10 +431,19 @@ fi
 
 # ------------------------------------------------------------------- SGLang
 if [ "$SGLANG" -eq 1 ]; then
-  say "SGLang serving venv (optional, ~9 GB)"
-  # A separate venv on purpose: SGLang pins torch tightly and installing it
-  # beside the working install would move the torch every other script here
-  # depends on.
+  say "SGLang serving (optional)"
+  # ONE venv is enough. This used to build a second one, on the reasoning that
+  # sglang pins transformers 5.x while the checkpoint needs 4.57.1 -- so a
+  # shared venv would get no model at all, and ~4.9 GB of the ~9 GB install was
+  # a second copy of torch and the CUDA runtime.
+  #
+  # That reasoning died with patches/05: the checkpoint runs on 5.x now.
+  # Verified end to end on a box whose sglang was already installed --
+  # sglang 0.5.16, torch 2.11.0+cu130, transformers 5.12.1, one venv, both the
+  # in-process engine and the server working against the same interpreter.
+  #
+  # So LA_SGLVENV defaults to the interpreter already in use. Point it somewhere
+  # else only if you actually want the two stacks separated.
   #
   # Worth having for OCR specifically. The in-process engine decodes six tokens
   # per forward through the parallel box decoder, which is right for coordinate
@@ -354,15 +452,26 @@ if [ "$SGLANG" -eq 1 ]; then
   # path (grep it: zero references to n_future or mtp), decodes one token at a
   # time, and transcribed the same page cleanly in 5.3s against 19.2s for the
   # in-process AR mode.
-  SGLPY="$SGLVENV/bin/python"
-  if [ ! -x "$SGLPY" ]; then
-    [ "$CHECK" -eq 1 ] && die "no SGLang venv at $SGLVENV"
-    python3 -m venv "$SGLVENV" || die "could not create $SGLVENV"
-    "$SGLPY" -m pip install -q -U pip setuptools wheel
+  if [ -n "$SGLVENV" ]; then
+    SGLPY="$SGLVENV/bin/python"
+    if [ ! -x "$SGLPY" ]; then
+      [ "$CHECK" -eq 1 ] && die "no SGLang venv at $SGLVENV"
+      python3 -m venv "$SGLVENV" || die "could not create $SGLVENV"
+      "$SGLPY" -m pip install -q -U pip setuptools wheel
+    fi
+  else
+    SGLPY="$PY"
+    ok "using the same interpreter as the model ($PY)"
   fi
   if ! "$SGLPY" -c "import sglang" >/dev/null 2>&1; then
-    [ "$CHECK" -eq 1 ] && die "sglang not installed in $SGLVENV"
+    [ "$CHECK" -eq 1 ] && die "sglang not importable from $SGLPY"
     warn "installing sglang (~9 GB, this takes a while)"
+    # Never into the interpreter that already has a working torch: sglang's
+    # exact pins would replace it, which is how a box that was fine stops
+    # being fine. Ask for a separate venv instead.
+    [ -n "$SGLVENV" ] || die "sglang is not installed in $PY, and installing it
+       here would pull its own torch over the one that works. Either use an
+       image that ships sglang, or set LA_SGLVENV=/path/to/venv and re-run."
     "$SGLPY" -m pip install "sglang[all]" || die "sglang install failed"
   fi
   SGLV="$("$SGLPY" -c 'import sglang;print(sglang.__version__)' 2>/dev/null)"
@@ -382,33 +491,86 @@ EOF
        install a build that includes it."
   ok "LocateAnything in-tree at ${LAFILE##*/site-packages/}"
 
-  # patches/02 is REQUIRED, not cosmetic. SGLang wraps MoonViT in its own
-  # VisionAttention, whose submodules are attn.qkv_proj / attn.proj, while the
-  # HF checkpoint names them wqkv / wo. Without the rename all 54
-  # vision-attention tensors (27 blocks x 2) miss params_dict and stay at random
-  # init. The tower still loads its MLPs and norms, so the SERVER COMES UP
-  # HEALTHY and every request returns a full-image box <0><0><1000><1000>,
-  # because the model never actually sees the image. Verified by reversing it:
-  # unpatched, 54 "not found in the checkpoint" warnings on load.
+  # patches/02 renames the checkpoint's vision-attention tensors (wqkv / wo) to
+  # the names SGLang's own MoonViT used (attn.qkv_proj / attn.proj). Get this
+  # wrong in either direction and all 54 of them (27 blocks x 2) miss
+  # params_dict and stay at random init -- and because the tower still loads its
+  # MLPs and norms, THE SERVER COMES UP HEALTHY and every request returns a
+  # full-image box <0><0><1000><1000>, since the model never sees the image.
+  #
+  # Which direction is right depends on the sglang version, so detect it rather
+  # than assume. Newer builds name their own modules wqkv / wo, matching the
+  # checkpoint, and there upstream has already fixed this -- applying patches/02
+  # renames the tensors AWAY from the correct names. It still applies cleanly,
+  # which is the trap. Measured on sglang 0.5.16: patched, 108 parameters did
+  # not receive weights; reverted, 0.
+  MOONVIT="$("$SGLPY" - <<'EOF'
+import importlib.util as u
+s = u.find_spec("sglang.srt.models.kimi_vl_moonvit")
+print(s.origin if s else "")
+EOF
+)"
   PATCH="$REPO/patches/02-sglang-locateanything-vision-weights.patch"
-  if grep -q 'attn.qkv_proj' "$LAFILE" 2>/dev/null; then
-    ok "vision-weight rename already present"
+  if [ -n "$MOONVIT" ] && grep -q 'self\.wqkv' "$MOONVIT" 2>/dev/null; then
+    ok "sglang $SGLV names its vision modules wqkv/wo — patches/02 not needed"
+    if grep -q 'attn.qkv_proj' "$LAFILE" 2>/dev/null; then
+      [ "$CHECK" -eq 1 ] && die "patches/02 IS applied to $LAFILE, and this sglang does
+       not want it: the vision tensors are renamed away from the names the
+       model actually uses, 108 parameters load at random init, and the server
+       comes up healthy returning whole-image boxes. Restore ${LAFILE##*/}.orig."
+      [ -f "$LAFILE.orig" ] \
+        && { cp "$LAFILE.orig" "$LAFILE"; ok "reverted patches/02 (this sglang does not need it)"; } \
+        || die "patches/02 is applied to $LAFILE but there is no .orig to restore.
+       Reinstall sglang, or reverse it by hand: patch -R -p0 $LAFILE < $PATCH"
+    fi
   else
-    [ "$CHECK" -eq 1 ] && die "patches/02 is NOT applied to $LAFILE — the vision tower
+    if grep -q 'attn.qkv_proj' "$LAFILE" 2>/dev/null; then
+      ok "vision-weight rename already present"
+    else
+      [ "$CHECK" -eq 1 ] && die "patches/02 is NOT applied to $LAFILE — the vision tower
        would load at random init and every box would be the whole image.
        Run ./setup.sh --sglang to apply it."
-    [ -f "$PATCH" ] || die "missing $PATCH"
-    command -v patch >/dev/null || die "'patch' not installed (apt-get install -y patch)"
-    cp "$LAFILE" "$LAFILE.orig"
-    patch -s -p0 "$LAFILE" < "$PATCH" \
-      || die "patches/02 did not apply to sglang $SGLV. The upstream file has moved;
+      [ -f "$PATCH" ] || die "missing $PATCH"
+      command -v patch >/dev/null || die "'patch' not installed (apt-get install -y patch)"
+      cp "$LAFILE" "$LAFILE.orig"
+      patch -s -p0 "$LAFILE" < "$PATCH" \
+        || die "patches/02 did not apply to sglang $SGLV. The upstream file has moved;
        the change itself is two lines -- see $PATCH."
-    ok "applied patches/02 (original kept at ${LAFILE##*/}.orig)"
+      ok "applied patches/02 (original kept at ${LAFILE##*/}.orig)"
+    fi
+    grep -q 'attn.qkv_proj' "$LAFILE" \
+      || die "patch reported success but $LAFILE still has no attn.qkv_proj rename"
+    ok "vision-weight rename verified in the installed file"
   fi
-  # Prove it took, rather than trusting patch's exit code.
-  grep -q 'attn.qkv_proj' "$LAFILE" \
-    || die "patch reported success but $LAFILE still has no attn.qkv_proj rename"
-  ok "vision-weight rename verified in the installed file"
+
+  # patches/06. SGLang's kimi_vl_moonvit.py is a verbatim vendoring of the
+  # checkpoint's modeling_vit.py, so it carries the same 3-D SDPA defect
+  # patches/01 fixes -- and locateanything_fix.apply() cannot reach it, because
+  # the server is a different process running a different module. Unpatched, the
+  # server loads clean, reports healthy, and dies on the first full-resolution
+  # page trying to allocate 10.62 GiB, taking the whole server down with it.
+  # Worse here than in-process: --mem-fraction-static has already claimed most
+  # of the card before the vision tower asks for scratch.
+  PATCH6="$REPO/patches/06-sglang-moonvit-sdpa-4d.patch"
+  if [ -z "$MOONVIT" ]; then
+    warn "no kimi_vl_moonvit.py in this sglang; skipping patches/06"
+  elif grep -q 'LA_VIT_FASTMASK' "$MOONVIT" 2>/dev/null; then
+    ok "patches/06 already applied"
+  else
+    [ "$CHECK" -eq 1 ] && die "patches/06 is NOT applied to $MOONVIT — the server will
+       OOM and exit on the first full-resolution page. Run ./setup.sh --sglang."
+    [ -f "$PATCH6" ] || die "missing $PATCH6"
+    cp "$MOONVIT" "$MOONVIT.orig"
+    patch -s -p0 "$MOONVIT" < "$PATCH6" \
+      || die "patches/06 did not apply to sglang $SGLV. See $PATCH6; it is the same
+       change patches/01 makes to the checkpoint."
+    grep -q 'LA_VIT_FASTMASK' "$MOONVIT" \
+      || die "patch reported success but $MOONVIT has no LA_VIT_FASTMASK"
+    ok "applied patches/06 (original kept at ${MOONVIT##*/}.orig)"
+  fi
+  warn "launch the server with LA_VIT_FASTMASK=1, or patches/06 stays inert:"
+  warn "  LA_VIT_FASTMASK=1 $SGLPY -m sglang.launch_server --model-path $MODEL_DIR \\"
+  warn "      --trust-remote-code --port 30000 --mem-fraction-static 0.80"
 fi
 
 # ------------------------------------------------------------------- verify
